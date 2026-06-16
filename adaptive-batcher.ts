@@ -1,3 +1,9 @@
+// ============================================================
+// Adaptive Batcher v4 — Production-ready
+// 支持: 自适应攒批、双缓冲无阻塞、背压、部分失败重试、
+//       取消/超时(含flushing中)、按key分区、健康快照
+// ============================================================
+
 export enum BatcherErrorCode {
   DISPOSED = 'BATCHER_DISPOSED',
   QUEUE_OVERFLOW = 'QUEUE_OVERFLOW',
@@ -6,6 +12,8 @@ export enum BatcherErrorCode {
   CANCELED = 'CANCELED',
   TIMEOUT = 'TIMEOUT',
   DROPPED = 'DROPPED',
+  PERMANENT_FAILURE = 'PERMANENT_FAILURE',
+  RETRY_EXHAUSTED = 'RETRY_EXHAUSTED',
 }
 
 export class BatcherError extends Error {
@@ -27,12 +35,29 @@ export class BatcherError extends Error {
   }
 }
 
+export class RetryableFailure extends Error {
+  readonly retryable = true as const;
+  constructor(message: string, public readonly cause?: unknown) {
+    super(message);
+    this.name = 'RetryableFailure';
+  }
+}
+
+export class PermanentFailure extends Error {
+  readonly permanent = true as const;
+  constructor(message: string, public readonly cause?: unknown) {
+    super(message);
+    this.name = 'PermanentFailure';
+  }
+}
+
 export type OverflowStrategy = 'reject' | 'drop' | 'block';
 export type DisposeStrategy = 'drain' | 'reject' | 'kill';
 
 export interface SubmitOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
+  key?: string;
 }
 
 export interface FlushEvent<T, R = unknown> {
@@ -44,6 +69,8 @@ export interface FlushEvent<T, R = unknown> {
   readonly results?: readonly R[];
   readonly items: readonly T[];
   readonly timestamp: number;
+  readonly attempt: number;
+  readonly key?: string;
 }
 
 export interface RollingStats {
@@ -72,6 +99,8 @@ export interface HealthStatus {
   readonly mode: 'low-latency' | 'balanced' | 'high-throughput' | 'idle';
   readonly lastEventAgeMs: number | null;
   readonly rollingStats: RollingStats;
+  readonly lastError: string | null;
+  readonly overflowCount: number;
 }
 
 export interface BatcherOptions<T, R> {
@@ -88,7 +117,10 @@ export interface BatcherOptions<T, R> {
   statsWindowMs?: number;
   adaptToFlushDuration?: boolean;
   adaptToFailureRate?: boolean;
-  flush: (batch: T[]) => Promise<R[]> | R[];
+  maxRetries?: number;
+  retryDelayMs?: number;
+  retryBackoffMultiplier?: number;
+  flush: (batch: T[], attempt: number) => Promise<R[]> | R[];
   onFlush?: (event: FlushEvent<T, R>) => void | Promise<void>;
   onError?: (error: BatcherError, batch: T[]) => void | Promise<void>;
   fallback?: (item: T) => R | Promise<R>;
@@ -102,6 +134,8 @@ interface PendingItem<T, R> {
   canceled: boolean;
   timeoutTimer?: ReturnType<typeof setTimeout>;
   abortListener?: () => void;
+  flushingTimer?: ReturnType<typeof setTimeout>;
+  deadline?: number;
 }
 
 interface RateTracker {
@@ -122,8 +156,13 @@ interface StatsWindow {
   batchesProcessed: number;
   batchesFailed: number;
   lastEventTime: number | null;
+  lastError: string | null;
+  overflowCount: number;
 }
 
+// ============================================================
+// Single-key AdaptiveBatcher
+// ============================================================
 export class AdaptiveBatcher<T, R> {
   private minBatchSize: number;
   private maxBatchSize: number;
@@ -136,12 +175,16 @@ export class AdaptiveBatcher<T, R> {
   private overflowStrategy: OverflowStrategy;
   private adaptToFlushDuration: boolean;
   private adaptToFailureRate: boolean;
+  private maxRetries: number;
+  private retryDelayMs: number;
+  private retryBackoffMultiplier: number;
 
   private activeBuffer: PendingItem<T, R>[] = [];
   private flushLock = false;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private inflightCount = 0;
   private inflightPromises: Set<Promise<void>> = new Set();
+  private inflightItems = new Set<PendingItem<T, R>>();
 
   private rateTracker: RateTracker;
   private ewmaRate = 0;
@@ -151,15 +194,18 @@ export class AdaptiveBatcher<T, R> {
 
   private statsWindow: StatsWindow;
 
-  private flush: (batch: T[]) => Promise<R[]> | R[];
+  private flush: (batch: T[], attempt: number) => Promise<R[]> | R[];
   private onFlush?: (event: FlushEvent<T, R>) => void | Promise<void>;
   private onError?: (error: BatcherError, batch: T[]) => void | Promise<void>;
   private fallback?: (item: T) => R | Promise<R>;
 
   private disposed = false;
   private disposing = false;
+  private killSwitch = false;
+  private killError?: BatcherError;
+  private batcherKey?: string;
 
-  constructor(options: BatcherOptions<T, R>) {
+  constructor(options: BatcherOptions<T, R> & { key?: string } = {} as BatcherOptions<T, R>) {
     this.minBatchSize = options.minBatchSize ?? 1;
     this.maxBatchSize = options.maxBatchSize ?? 500;
     this.targetBatchSize = options.initialBatchSize ?? Math.max(10, this.minBatchSize);
@@ -171,6 +217,10 @@ export class AdaptiveBatcher<T, R> {
     this.overflowStrategy = options.overflowStrategy ?? 'reject';
     this.adaptToFlushDuration = options.adaptToFlushDuration ?? true;
     this.adaptToFailureRate = options.adaptToFailureRate ?? true;
+    this.maxRetries = options.maxRetries ?? 0;
+    this.retryDelayMs = options.retryDelayMs ?? 10;
+    this.retryBackoffMultiplier = options.retryBackoffMultiplier ?? 2;
+    this.batcherKey = (options as { key?: string }).key;
     this.rateTracker = {
       timestamps: [],
       windowMs: options.rateWindowMs ?? 1000,
@@ -182,6 +232,8 @@ export class AdaptiveBatcher<T, R> {
       batchesProcessed: 0,
       batchesFailed: 0,
       lastEventTime: null,
+      lastError: null,
+      overflowCount: 0,
     };
     this.flush = options.flush;
     this.onFlush = options.onFlush;
@@ -208,6 +260,7 @@ export class AdaptiveBatcher<T, R> {
 
     const totalQueued = this.activeBuffer.length + this.inflightCount * this.targetBatchSize;
     if (totalQueued >= this.maxQueueSize) {
+      this.statsWindow.overflowCount++;
       return this.handleOverflow(item, options);
     }
 
@@ -222,6 +275,7 @@ export class AdaptiveBatcher<T, R> {
       };
 
       if (options.timeoutMs != null && options.timeoutMs > 0) {
+        pendingItem.deadline = now + options.timeoutMs;
         pendingItem.timeoutTimer = setTimeout(() => {
           this.cancelPending(pendingItem, BatcherErrorCode.TIMEOUT, `Submit timed out after ${options.timeoutMs}ms`);
         }, options.timeoutMs);
@@ -256,6 +310,10 @@ export class AdaptiveBatcher<T, R> {
       clearTimeout(item.timeoutTimer);
       item.timeoutTimer = undefined;
     }
+    if (item.flushingTimer) {
+      clearTimeout(item.flushingTimer);
+      item.flushingTimer = undefined;
+    }
     if (item.abortListener) {
       try {
         item.abortListener = undefined;
@@ -270,24 +328,29 @@ export class AdaptiveBatcher<T, R> {
     item.reject(new BatcherError(code, message, { retryable: code === BatcherErrorCode.TIMEOUT }));
   }
 
-  private async handleOverflow(item: T, options: SubmitOptions): Promise<R> {
+  private handleOverflow(item: T, options: SubmitOptions): Promise<R> {
     switch (this.overflowStrategy) {
       case 'drop': {
         if (this.fallback) {
           try {
-            return await this.fallback(item);
+            const result = this.fallback(item);
+            return Promise.resolve(result);
           } catch (e) {
-            throw new BatcherError(
-              BatcherErrorCode.DROPPED,
-              'Item dropped due to queue overflow, fallback failed',
-              { retryable: true, cause: e }
+            return Promise.reject(
+              new BatcherError(
+                BatcherErrorCode.DROPPED,
+                'Item dropped due to queue overflow, fallback failed',
+                { retryable: true, cause: e }
+              )
             );
           }
         }
-        throw new BatcherError(
-          BatcherErrorCode.DROPPED,
-          'Item dropped due to queue overflow (no fallback configured)',
-          { retryable: true, data: { item } }
+        return Promise.reject(
+          new BatcherError(
+            BatcherErrorCode.DROPPED,
+            'Item dropped due to queue overflow (no fallback configured)',
+            { retryable: true, data: { item } }
+          )
         );
       }
       case 'block': {
@@ -331,13 +394,15 @@ export class AdaptiveBatcher<T, R> {
       }
       case 'reject':
       default:
-        throw new BatcherError(
-          BatcherErrorCode.QUEUE_OVERFLOW,
-          `Queue overflow: ${this.maxQueueSize} items max`,
-          {
-            retryable: true,
-            data: { item, queueSize: this.activeBuffer.length, inflightCount: this.inflightCount },
-          }
+        return Promise.reject(
+          new BatcherError(
+            BatcherErrorCode.QUEUE_OVERFLOW,
+            `Queue overflow: ${this.maxQueueSize} items max`,
+            {
+              retryable: true,
+              data: { item, queueSize: this.activeBuffer.length, inflightCount: this.inflightCount },
+            }
+          )
         );
     }
   }
@@ -358,6 +423,7 @@ export class AdaptiveBatcher<T, R> {
     queuedWaitMs: number,
     flushDurationMs: number,
     success: boolean,
+    error: unknown,
     now: number
   ): void {
     if (this.adaptToFlushDuration) {
@@ -374,6 +440,11 @@ export class AdaptiveBatcher<T, R> {
     sw.batchesProcessed += 1;
     if (!success) sw.batchesFailed += 1;
     sw.lastEventTime = now;
+    if (error instanceof Error) {
+      sw.lastError = error.message;
+    } else if (typeof error === 'string') {
+      sw.lastError = error;
+    }
     while (sw.events.length > 0 && now - sw.events[0].timestamp > sw.windowMs) {
       const evicted = sw.events.shift()!;
       sw.itemsProcessed -= evicted.batchSize;
@@ -505,15 +576,15 @@ export class AdaptiveBatcher<T, R> {
     }
   }
 
-  private safeInvokeObserver<R>(
-    fn: (() => R | Promise<R>) | undefined,
+  private safeInvokeObserver<X>(
+    fn: (() => X | Promise<X>) | undefined,
     label: string
   ): void {
     if (!fn) return;
     try {
       const result = fn();
-      if (result && typeof (result as Promise<R>).then === 'function') {
-        (result as Promise<R>).catch((e) => {
+      if (result && typeof (result as Promise<X>).then === 'function') {
+        (result as Promise<X>).catch((e) => {
           console.warn(`[AdaptiveBatcher] ${label} observer async error:`, e);
         });
       }
@@ -522,7 +593,8 @@ export class AdaptiveBatcher<T, R> {
     }
   }
 
-  private async doFlush(): Promise<void> {
+  // ---- 核心 flush：支持部分失败 + 重试 + flushing 中可取消 ----
+  private doFlush(): void {
     if (this.flushLock) return;
     if (this.activeBuffer.length === 0) return;
     if (this.inflightCount >= this.maxInflightBatches) return;
@@ -539,7 +611,6 @@ export class AdaptiveBatcher<T, R> {
 
     this.inflightCount++;
 
-    const items = batch.map((b) => b.item);
     const queuedAt = batch[0].timestamp;
     const queuedWaitMs = Date.now() - queuedAt;
     const flushStartedAt = Date.now();
@@ -554,70 +625,287 @@ export class AdaptiveBatcher<T, R> {
           it.abortListener = undefined;
         } catch {}
       }
+
+      if (it.deadline != null && !it.canceled) {
+        const remaining = it.deadline - Date.now();
+        if (remaining <= 0) {
+          this.rejectItem(it, BatcherErrorCode.TIMEOUT, `Submit timed out (deadline passed before flush)`);
+          continue;
+        }
+        it.flushingTimer = setTimeout(() => {
+          this.rejectItem(it, BatcherErrorCode.TIMEOUT, `Submit timed out during flush after ${it.deadline - it.timestamp}ms`);
+        }, remaining);
+      }
     }
 
-    const inflightPromise = (async () => {
-      let success = false;
-      let error: unknown;
-      let results: R[] | undefined;
+    const aliveBatch = batch.filter((it) => !it.canceled);
+    if (aliveBatch.length === 0) {
+      this.inflightCount--;
+      this.tickle();
+      return;
+    }
 
-      try {
-        results = await this.flush(items);
-        if (results.length !== batch.length) {
-          error = new BatcherError(
-            BatcherErrorCode.MISMATCHED_RESULTS,
-            `Flush returned ${results.length} results for ${batch.length} items`,
-            { retryable: true }
-          );
-          batch.forEach(({ reject }) => reject(error));
-          this.safeInvokeObserver(
-            () => this.onError?.(error as BatcherError, items),
-            'onError'
-          );
-        } else {
-          success = true;
-          batch.forEach(({ resolve }, i) => resolve(results![i]));
+    for (const it of aliveBatch) {
+      this.inflightItems.add(it);
+    }
+
+    const inflightPromise = this.runFlushWithRetry(aliveBatch, queuedWaitMs, flushStartedAt)
+      .finally(() => {
+        for (const it of aliveBatch) {
+          this.inflightItems.delete(it);
         }
-      } catch (caught) {
-        error = caught;
-        const wrapped = new BatcherError(
-          BatcherErrorCode.FLUSH_FAILED,
-          `Flush failed: ${(caught as Error).message}`,
-          { cause: caught, retryable: true }
-        );
-        batch.forEach(({ reject }) => reject(wrapped));
-        this.safeInvokeObserver(
-          () => this.onError?.(wrapped, items),
-          'onError'
-        );
-      } finally {
-        const now = Date.now();
-        const flushDurationMs = now - flushStartedAt;
-        this.recordFlush(batch.length, queuedWaitMs, flushDurationMs, success, now);
-
-        this.safeInvokeObserver(
-          () =>
-            this.onFlush?.({
-              batchSize: batch.length,
-              queuedWaitMs,
-              flushDurationMs,
-              success,
-              error,
-              results,
-              items,
-              timestamp: now,
-            }),
-          'onFlush'
-        );
-
-        this.inflightCount--;
         this.inflightPromises.delete(inflightPromise);
+        this.inflightCount--;
         this.tickle();
-      }
-    })();
-
+      });
     this.inflightPromises.add(inflightPromise);
   }
+
+  private rejectItem(item: PendingItem<T, R>, code: BatcherErrorCode, message: string): void {
+    if (item.canceled) return;
+    item.canceled = true;
+    if (item.flushingTimer) {
+      clearTimeout(item.flushingTimer);
+      item.flushingTimer = undefined;
+    }
+    if (item.timeoutTimer) {
+      clearTimeout(item.timeoutTimer);
+      item.timeoutTimer = undefined;
+    }
+    item.reject(new BatcherError(code, message, { retryable: code === BatcherErrorCode.TIMEOUT }));
+  }
+
+  private async runFlushWithRetry(
+    batch: PendingItem<T, R>[],
+    queuedWaitMs: number,
+    flushStartedAt: number
+  ): Promise<void> {
+    let attempt = 0;
+    let remainingItems = batch;
+    let lastError: unknown;
+    let totalSucceeded = 0;
+    let hasAnyFailure = false;
+
+    const totalAttempts = this.maxRetries + 1;
+
+    while (attempt < totalAttempts && remainingItems.length > 0 && !this.killSwitch) {
+      attempt++;
+      const items = remainingItems.map((b) => b.item);
+
+      if (attempt > 1) {
+        const delay = this.retryDelayMs * Math.pow(this.retryBackoffMultiplier, attempt - 2);
+        await this.sleep(delay);
+        if (this.killSwitch) break;
+      }
+
+      const alive = remainingItems.filter((it) => !it.canceled);
+      if (alive.length === 0) {
+        remainingItems = [];
+        break;
+      }
+      if (alive.length !== remainingItems.length) {
+        remainingItems = alive;
+        continue;
+      }
+
+      const attemptStart = Date.now();
+      const aliveItems = remainingItems.map((b) => b.item);
+
+      try {
+        const rawResults = await this.flush(aliveItems, attempt);
+
+        const results = this.normalizeResults(rawResults, aliveItems.length);
+        const successCount = results.filter((r) => r.ok).length;
+
+        if (successCount === results.length) {
+          for (let i = 0; i < remainingItems.length; i++) {
+            const item = remainingItems[i];
+            if (item.canceled) continue;
+            if (item.flushingTimer) {
+              clearTimeout(item.flushingTimer);
+              item.flushingTimer = undefined;
+            }
+            if (results[i].ok) {
+              item.resolve(results[i].value as R);
+              totalSucceeded++;
+            }
+          }
+          lastError = undefined;
+          remainingItems = [];
+          break;
+        }
+
+        const stillPending: PendingItem<T, R>[] = [];
+
+        for (let i = 0; i < results.length; i++) {
+          const r = results[i];
+          const item = remainingItems[i];
+          if (item.canceled) continue;
+
+          if (r.ok) {
+            if (item.flushingTimer) {
+              clearTimeout(item.flushingTimer);
+              item.flushingTimer = undefined;
+            }
+            item.resolve(r.value as R);
+            totalSucceeded++;
+          } else if (r.permanent) {
+            if (item.flushingTimer) {
+              clearTimeout(item.flushingTimer);
+              item.flushingTimer = undefined;
+            }
+            const err = new BatcherError(
+              BatcherErrorCode.PERMANENT_FAILURE,
+              `Permanent failure: ${r.errorMessage}`,
+              { retryable: false, cause: r.error }
+            );
+            item.reject(err);
+            hasAnyFailure = true;
+          } else if (r.retryable) {
+            if (attempt >= totalAttempts) {
+              if (item.flushingTimer) {
+                clearTimeout(item.flushingTimer);
+                item.flushingTimer = undefined;
+              }
+              const err = new BatcherError(
+                BatcherErrorCode.RETRY_EXHAUSTED,
+                `Retry exhausted after ${attempt} attempts: ${r.errorMessage}`,
+                { retryable: true, cause: r.error }
+              );
+              item.reject(err);
+              hasAnyFailure = true;
+            } else {
+              stillPending.push(item);
+            }
+          }
+        }
+
+        remainingItems = stillPending;
+        if (stillPending.length > 0) {
+          lastError = results.find((r) => !r.ok && r.error)?.error;
+        } else {
+          const firstFail = results.find((r) => !r.ok);
+          if (firstFail && 'error' in firstFail) {
+            lastError = firstFail.error;
+          }
+        }
+      } catch (caught) {
+        lastError = caught;
+        if (attempt >= totalAttempts) {
+          const wrapped = new BatcherError(
+            BatcherErrorCode.FLUSH_FAILED,
+            `Flush failed after ${attempt} attempts: ${(caught as Error).message}`,
+            { cause: caught, retryable: true }
+          );
+          for (const item of remainingItems) {
+            if (item.canceled) continue;
+            if (item.flushingTimer) {
+              clearTimeout(item.flushingTimer);
+              item.flushingTimer = undefined;
+            }
+            item.reject(wrapped);
+          }
+          hasAnyFailure = true;
+          this.safeInvokeObserver(
+            () => this.onError?.(wrapped, items),
+            'onError'
+          );
+          remainingItems = [];
+        }
+      }
+    }
+
+    if (this.killSwitch && remainingItems.length > 0 && this.killError) {
+      for (const item of remainingItems) {
+        if (item.canceled) continue;
+        if (item.flushingTimer) {
+          clearTimeout(item.flushingTimer);
+          item.flushingTimer = undefined;
+        }
+        item.reject(this.killError);
+      }
+      remainingItems = [];
+    }
+
+    const now = Date.now();
+    const totalDurationMs = now - flushStartedAt;
+    const batchSize = batch.length;
+    const aliveCount = batch.filter((it) => !it.canceled).length;
+    const success = !hasAnyFailure && !this.killSwitch && totalSucceeded === aliveCount;
+
+    this.recordFlush(
+      batchSize,
+      queuedWaitMs,
+      totalDurationMs,
+      success,
+      lastError,
+      now
+    );
+
+    this.safeInvokeObserver(
+      () =>
+        this.onFlush?.({
+          batchSize,
+          queuedWaitMs,
+          flushDurationMs: totalDurationMs,
+          success,
+          error: lastError,
+          items: batch.map((b) => b.item),
+          timestamp: now,
+          attempt,
+          key: this.batcherKey,
+        }),
+      'onFlush'
+    );
+  }
+
+  private normalizeResults(
+    raw: R[] | unknown[],
+    expectedLength: number
+  ): Array<
+    | { ok: true; value: R }
+    | { retryable: true; error: unknown; errorMessage: string }
+    | { permanent: true; error: unknown; errorMessage: string }
+  > {
+    if (!Array.isArray(raw)) {
+      return Array(expectedLength).fill(null).map(() => ({
+        retryable: true,
+        error: new Error('Flush returned non-array result'),
+        errorMessage: 'Flush returned non-array result',
+      }));
+    }
+
+    if (raw.length !== expectedLength) {
+      return Array(expectedLength).fill(null).map(() => ({
+        retryable: true,
+        error: new BatcherError(
+          BatcherErrorCode.MISMATCHED_RESULTS,
+          `Flush returned ${raw.length} results for ${expectedLength} items`,
+          { retryable: true }
+        ),
+        errorMessage: `Result count mismatch (${raw.length}/${expectedLength})`,
+      }));
+    }
+
+    return raw.map((r) => {
+      if (r instanceof PermanentFailure) {
+        return { permanent: true, error: r.cause ?? r, errorMessage: r.message } as const;
+      }
+      if (r instanceof RetryableFailure) {
+        return { retryable: true, error: r.cause ?? r, errorMessage: r.message } as const;
+      }
+      if (r instanceof Error) {
+        return { retryable: true, error: r, errorMessage: r.message } as const;
+      }
+      return { ok: true, value: r as R } as const;
+    });
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  // ---- Public API ----
 
   async forceFlush(): Promise<void> {
     while (this.activeBuffer.length > 0) {
@@ -642,23 +930,34 @@ export class AdaptiveBatcher<T, R> {
     this.clearTimer();
 
     if (strategy === 'kill') {
-      const err = new BatcherError(
+      this.killSwitch = true;
+      this.killError = new BatcherError(
         BatcherErrorCode.DISPOSED,
-        'Batcher killed: all pending requests rejected',
+        'Batcher killed: all pending requests rejected immediately',
         { retryable: true }
       );
+
       for (const item of this.activeBuffer) {
         if (item.timeoutTimer) clearTimeout(item.timeoutTimer);
+        if (item.flushingTimer) clearTimeout(item.flushingTimer);
         if (item.abortListener) {
           try {
             item.abortListener = undefined;
           } catch {}
         }
-        if (!item.canceled) item.reject(err);
+        if (!item.canceled) item.reject(this.killError);
       }
       this.activeBuffer = [];
+
+      for (const item of this.inflightItems) {
+        if (!item.canceled) {
+          if (item.flushingTimer) clearTimeout(item.flushingTimer);
+          item.reject(this.killError);
+          item.canceled = true;
+        }
+      }
+
       this.disposed = true;
-      await this.drainInflight();
       return;
     }
 
@@ -670,6 +969,7 @@ export class AdaptiveBatcher<T, R> {
       );
       for (const item of this.activeBuffer) {
         if (item.timeoutTimer) clearTimeout(item.timeoutTimer);
+        if (item.flushingTimer) clearTimeout(item.flushingTimer);
         if (item.abortListener) {
           try {
             item.abortListener = undefined;
@@ -705,6 +1005,7 @@ export class AdaptiveBatcher<T, R> {
       );
       for (const item of this.activeBuffer) {
         if (item.timeoutTimer) clearTimeout(item.timeoutTimer);
+        if (item.flushingTimer) clearTimeout(item.flushingTimer);
         if (item.abortListener) {
           try {
             item.abortListener = undefined;
@@ -744,6 +1045,7 @@ export class AdaptiveBatcher<T, R> {
           this.maxQueueSize) *
           100
       ),
+      maxRetries: this.maxRetries,
     };
   }
 
@@ -845,6 +1147,8 @@ export class AdaptiveBatcher<T, R> {
       mode: this.mode,
       lastEventAgeMs,
       rollingStats: stats,
+      lastError: this.statsWindow.lastError,
+      overflowCount: this.statsWindow.overflowCount,
     };
   }
 
@@ -861,5 +1165,256 @@ export class AdaptiveBatcher<T, R> {
 
   private lerp(a: number, b: number, t: number): number {
     return a + (b - a) * Math.max(0, Math.min(1, t));
+  }
+
+  get isDisposed(): boolean {
+    return this.disposed;
+  }
+}
+
+// ============================================================
+// Partitioned Adaptive Batcher — 按 key 分区攒批
+// ============================================================
+export interface PartitionedBatcherOptions<T, R> {
+  defaultKey?: string;
+  maxKeys?: number;
+  maxTotalQueueSize?: number;
+  perKeyMaxQueueSize?: number;
+  perKeyMinBatchSize?: number;
+  perKeyMaxBatchSize?: number;
+  perKeyInitialBatchSize?: number;
+  perKeyMinWaitMs?: number;
+  perKeyMaxWaitMs?: number;
+  perKeyInitialWaitMs?: number;
+  perKeyMaxInflightBatches?: number;
+  rateWindowMs?: number;
+  statsWindowMs?: number;
+  overflowStrategy?: OverflowStrategy;
+  adaptToFlushDuration?: boolean;
+  adaptToFailureRate?: boolean;
+  maxRetries?: number;
+  retryDelayMs?: number;
+  retryBackoffMultiplier?: number;
+  flush: (key: string, batch: T[], attempt: number) => Promise<R[]> | R[];
+  onFlush?: (key: string, event: FlushEvent<T, R>) => void | Promise<void>;
+  onError?: (key: string, error: BatcherError, batch: T[]) => void | Promise<void>;
+  perKeyFallback?: (key: string, item: T) => R | Promise<R>;
+  keyLabel?: (key: string) => string;
+}
+
+export interface KeyStats {
+  readonly key: string;
+  readonly queueSize: number;
+  readonly inflightBatches: number;
+  readonly capacityUsedPercent: number;
+  readonly ewmaRate: number;
+  readonly ewmaFlushDurationMs: number;
+  readonly ewmaFailureRate: number;
+  readonly targetBatchSize: number;
+  readonly waitWindowMs: number;
+  readonly health: HealthStatus;
+  readonly mode: 'low-latency' | 'balanced' | 'high-throughput' | 'idle';
+  readonly lastError: string | null;
+  readonly overflowCount: number;
+}
+
+export interface PartitionedSnapshot {
+  readonly timestamp: number;
+  readonly totalKeys: number;
+  readonly totalQueueSize: number;
+  readonly totalInflightBatches: number;
+  readonly totalCapacityUsedPercent: number;
+  readonly globalHealth: 'healthy' | 'degraded' | 'unhealthy' | 'stale';
+  readonly topKeysByQueue: KeyStats[];
+  readonly topKeysByFailure: KeyStats[];
+  readonly perKey: Record<string, KeyStats>;
+}
+
+export class PartitionedAdaptiveBatcher<T, R> {
+  private batchers = new Map<string, AdaptiveBatcher<T, R>>();
+  private defaultKey: string;
+  private maxKeys: number;
+  private maxTotalQueueSize: number;
+  private perKeyMaxQueueSize: number;
+  private perKeyOptions: PartitionedBatcherOptions<T, R>;
+  private disposed = false;
+
+  constructor(options: PartitionedBatcherOptions<T, R>) {
+    this.defaultKey = options.defaultKey ?? '__default__';
+    this.maxKeys = options.maxKeys ?? 1000;
+    this.maxTotalQueueSize = options.maxTotalQueueSize ?? 50_000;
+    this.perKeyMaxQueueSize = options.perKeyMaxQueueSize ?? 10_000;
+    this.perKeyOptions = options;
+  }
+
+  private getBatcher(key: string): AdaptiveBatcher<T, R> {
+    let batcher = this.batchers.get(key);
+    if (!batcher) {
+      if (this.batchers.size >= this.maxKeys) {
+        throw new BatcherError(
+          BatcherErrorCode.QUEUE_OVERFLOW,
+          `Too many distinct keys: max ${this.maxKeys} allowed`,
+          { retryable: true }
+        );
+      }
+      batcher = this.createBatcher(key);
+      this.batchers.set(key, batcher);
+    }
+    return batcher;
+  }
+
+  private createBatcher(key: string): AdaptiveBatcher<T, R> {
+    const opts = this.perKeyOptions;
+    return new AdaptiveBatcher<T, R>({
+      minBatchSize: opts.perKeyMinBatchSize,
+      maxBatchSize: opts.perKeyMaxBatchSize,
+      initialBatchSize: opts.perKeyInitialBatchSize,
+      minWaitMs: opts.perKeyMinWaitMs,
+      maxWaitMs: opts.perKeyMaxWaitMs,
+      initialWaitMs: opts.perKeyInitialWaitMs,
+      rateWindowMs: opts.rateWindowMs,
+      maxInflightBatches: opts.perKeyMaxInflightBatches,
+      maxQueueSize: this.perKeyMaxQueueSize,
+      overflowStrategy: opts.overflowStrategy,
+      statsWindowMs: opts.statsWindowMs,
+      adaptToFlushDuration: opts.adaptToFlushDuration,
+      adaptToFailureRate: opts.adaptToFailureRate,
+      maxRetries: opts.maxRetries,
+      retryDelayMs: opts.retryDelayMs,
+      retryBackoffMultiplier: opts.retryBackoffMultiplier,
+      key,
+      flush: (batch, attempt) => opts.flush(key, batch, attempt),
+      onFlush: opts.onFlush ? (event) => opts.onFlush!(key, event) : undefined,
+      onError: opts.onError ? (err, batch) => opts.onError!(key, err, batch) : undefined,
+      fallback: opts.perKeyFallback ? (item) => opts.perKeyFallback!(key, item) : undefined,
+    } as BatcherOptions<T, R> & { key: string });
+  }
+
+  submit(item: T, options: SubmitOptions = {}): Promise<R> {
+    if (this.disposed) {
+      return Promise.reject(
+        new BatcherError(BatcherErrorCode.DISPOSED, 'PartitionedBatcher has been disposed', {
+          retryable: false,
+        })
+      );
+    }
+    const key = options.key ?? this.defaultKey;
+
+    const totalQueued = this.totalQueueSize;
+    if (totalQueued >= this.maxTotalQueueSize) {
+      return Promise.reject(
+        new BatcherError(
+          BatcherErrorCode.QUEUE_OVERFLOW,
+          `Total queue overflow: ${this.maxTotalQueueSize} items max`,
+          { retryable: true, data: { key, totalQueued, maxTotalQueueSize: this.maxTotalQueueSize } }
+        )
+      );
+    }
+
+    return this.getBatcher(key).submit(item, options);
+  }
+
+  get totalQueueSize(): number {
+    let total = 0;
+    for (const batcher of this.batchers.values()) {
+      const m = batcher.metrics;
+      total += m.currentQueueSize + m.inflightBatches * m.targetBatchSize;
+    }
+    return total;
+  }
+
+  get totalInflightBatches(): number {
+    let total = 0;
+    for (const batcher of this.batchers.values()) {
+      total += batcher.metrics.inflightBatches;
+    }
+    return total;
+  }
+
+  get keyCount(): number {
+    return this.batchers.size;
+  }
+
+  getKeyStats(key: string): KeyStats | null {
+    const batcher = this.batchers.get(key);
+    if (!batcher) return null;
+    const m = batcher.metrics;
+    return {
+      key,
+      queueSize: m.currentQueueSize,
+      inflightBatches: m.inflightBatches,
+      capacityUsedPercent: m.capacityUsedPercent,
+      ewmaRate: m.ewmaRate,
+      ewmaFlushDurationMs: m.ewmaFlushDurationMs,
+      ewmaFailureRate: m.ewmaFailureRate,
+      targetBatchSize: m.targetBatchSize,
+      waitWindowMs: m.waitWindowMs,
+      health: batcher.health,
+      mode: batcher.mode,
+      lastError: batcher.health.lastError,
+      overflowCount: batcher.health.overflowCount,
+    };
+  }
+
+  getSnapshot(options: { topN?: number } = {}): PartitionedSnapshot {
+    const topN = options.topN ?? 10;
+    const perKey: Record<string, KeyStats> = {};
+    const allKeys: KeyStats[] = [];
+
+    for (const key of this.batchers.keys()) {
+      const stats = this.getKeyStats(key);
+      if (stats) {
+        perKey[key] = stats;
+        allKeys.push(stats);
+      }
+    }
+
+    const topByQueue = [...allKeys].sort((a, b) => b.queueSize - a.queueSize).slice(0, topN);
+    const topByFailure = [...allKeys].sort((a, b) => b.ewmaFailureRate - a.ewmaFailureRate).slice(0, topN);
+
+    const totalQueue = allKeys.reduce((s, k) => s + k.queueSize, 0);
+    const totalInflight = allKeys.reduce((s, k) => s + k.inflightBatches, 0);
+    const totalCap = Math.round((totalQueue / this.maxTotalQueueSize) * 100);
+
+    let globalHealth: PartitionedSnapshot['globalHealth'] = 'healthy';
+    if (allKeys.length === 0 || allKeys.every((k) => k.health.status === 'stale')) {
+      globalHealth = 'stale';
+    } else if (allKeys.some((k) => k.health.status === 'unhealthy')) {
+      globalHealth = 'unhealthy';
+    } else if (allKeys.some((k) => k.health.status === 'degraded')) {
+      globalHealth = 'degraded';
+    }
+
+    return {
+      timestamp: Date.now(),
+      totalKeys: allKeys.length,
+      totalQueueSize: totalQueue,
+      totalInflightBatches: totalInflight,
+      totalCapacityUsedPercent: totalCap,
+      globalHealth,
+      topKeysByQueue: topByQueue,
+      topKeysByFailure: topByFailure,
+      perKey,
+    };
+  }
+
+  async forceFlush(key?: string): Promise<void> {
+    if (key) {
+      const batcher = this.batchers.get(key);
+      if (batcher) await batcher.forceFlush();
+      return;
+    }
+    await Promise.all(Array.from(this.batchers.values()).map((b) => b.forceFlush()));
+  }
+
+  async dispose(strategy: DisposeStrategy = 'drain'): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    await Promise.all(Array.from(this.batchers.values()).map((b) => b.dispose(strategy)));
+    this.batchers.clear();
+  }
+
+  get isDisposed(): boolean {
+    return this.disposed;
   }
 }

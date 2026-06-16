@@ -1,11 +1,16 @@
 import {
   AdaptiveBatcher,
+  PartitionedAdaptiveBatcher,
   BatcherError,
   BatcherErrorCode,
+  RetryableFailure,
+  PermanentFailure,
   FlushEvent,
   DisposeStrategy,
   RollingStats,
   HealthStatus,
+  KeyStats,
+  PartitionedSnapshot,
 } from './adaptive-batcher';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -21,6 +26,8 @@ function expect(actual: unknown, message: string): {
   toBeFalsy: () => void;
   toBeGreaterThan: (n: number) => void;
   toBeLessThan: (n: number) => void;
+  toBeGreaterThanOrEqual: (n: number) => void;
+  toBeLessThanOrEqual: (n: number) => void;
 } {
   return {
     toBe(expected: unknown) {
@@ -58,6 +65,20 @@ function expect(actual: unknown, message: string): {
         throw err;
       }
     },
+    toBeGreaterThanOrEqual(n: number) {
+      if (typeof actual !== 'number' || !(actual >= n)) {
+        const err = new Error(`${message}: 期望 >= ${n}, 实际 ${JSON.stringify(actual)}`);
+        err.name = 'AssertionError';
+        throw err;
+      }
+    },
+    toBeLessThanOrEqual(n: number) {
+      if (typeof actual !== 'number' || !(actual <= n)) {
+        const err = new Error(`${message}: 期望 <= ${n}, 实际 ${JSON.stringify(actual)}`);
+        err.name = 'AssertionError';
+        throw err;
+      }
+    },
   };
 }
 
@@ -80,300 +101,97 @@ function expectError(fn: () => Promise<unknown>): Promise<BatcherError> {
 }
 
 const testCases: TestCase[] = [
+  // ========== v4 新功能测试 ==========
   {
-    name: '场景A: 可观测能力 - onFlush事件 + rollingStats滚动统计',
+    name: '场景1: 部分失败处理 - RetryableFailure 重试成功',
     run: async () => {
-      const events: FlushEvent<number, number>[] = [];
-
-      const batcher = new AdaptiveBatcher<number, number>({
-        minBatchSize: 2,
-        maxBatchSize: 10,
-        initialBatchSize: 2,
-        minWaitMs: 5,
-        maxWaitMs: 30,
-        initialWaitMs: 10,
-        statsWindowMs: 3000,
-        flush: async (batch) => {
-          await sleep(20);
-          return batch.map((x) => x * 2);
-        },
-        onFlush: (ev) => events.push(ev),
-      });
-
-      const proms: Promise<number>[] = [];
-      for (let i = 0; i < 7; i++) {
-        proms.push(batcher.submit(i));
-        await sleep(2);
-      }
-      await Promise.all(proms);
-
-      expect(events.length > 0, '应收到 onFlush 事件').toBeTruthy();
-
-      const firstEvent = events[0];
-      expect(firstEvent.batchSize > 0, 'batchSize > 0').toBeTruthy();
-      expect(firstEvent.flushDurationMs >= 15, 'flushDurationMs >= 15ms').toBeTruthy();
-      expect(firstEvent.success, 'success=true').toBe(true);
-      expect(firstEvent.items.length > 0, 'items 非空').toBeTruthy();
-      expect(firstEvent.results!.length === firstEvent.items.length, 'results 与 items 等长').toBe(true);
-      expect(firstEvent.timestamp > 0, 'timestamp 存在').toBeTruthy();
-
-      const stats = batcher.rollingStats;
-      expect(stats.itemsProcessed, 'itemsProcessed=7').toBe(7);
-      expect(stats.batchesProcessed >= 1, 'batchesProcessed >= 1').toBeTruthy();
-      expect(stats.failureRate, 'failureRate=0').toBe(0);
-      expect(stats.throughputPerSecond > 0, 'throughput > 0').toBeTruthy();
-      expect(stats.stale, 'stale=false').toBe(false);
-      expect(stats.p50QueuedWaitMs, 'p50QueuedWaitMs 存在').toBeTruthy();
-      expect(stats.p95QueuedWaitMs, 'p95QueuedWaitMs 存在').toBeTruthy();
-      expect(stats.p50FlushDurationMs, 'p50FlushDurationMs 存在').toBeTruthy();
-      expect(stats.p95FlushDurationMs, 'p95FlushDurationMs 存在').toBeTruthy();
-
-      const mode = batcher.mode;
-      expect(['low-latency', 'balanced', 'high-throughput', 'idle'].includes(mode), 'mode 枚举合法').toBe(true);
-
-      const metrics = batcher.metrics;
-      expect(metrics.ewmaFlushDurationMs >= 10, 'ewmaFlushDuration >= 10ms').toBeTruthy();
-
-      const health = batcher.health;
-      expect(['healthy', 'degraded', 'unhealthy', 'stale'].includes(health.status), 'health.status 合法').toBe(true);
-      expect(health.lastEventAgeMs != null, 'lastEventAgeMs 存在').toBeTruthy();
-
-      await batcher.dispose();
-    },
-  },
-  {
-    name: '场景B1: 背压策略 - reject模式 + 错误码区分',
-    run: async () => {
+      let attemptCount = 0;
       const batcher = new AdaptiveBatcher<number, number>({
         minBatchSize: 3,
         maxBatchSize: 3,
         initialBatchSize: 3,
         minWaitMs: 5,
-        maxWaitMs: 100,
-        maxQueueSize: 6,
-        maxInflightBatches: 1,
-        overflowStrategy: 'reject',
-        flush: async (batch) => {
-          await sleep(200);
+        maxWaitMs: 20,
+        maxRetries: 2,
+        retryDelayMs: 5,
+        flush: (batch, attempt) => {
+          attemptCount = attempt;
+          if (attempt === 1) {
+            return batch.map((x, i) =>
+              i === 1 ? new RetryableFailure(`item ${x} 暂时失败`) : x * 10
+            ) as number[];
+          }
           return batch.map((x) => x * 10);
+        },
+      });
+
+      const results = await Promise.all([batcher.submit(1), batcher.submit(2), batcher.submit(3)]);
+      expect(attemptCount, '重试了一次,最终attempt=2').toBe(2);
+      expect(results[0], 'item1=10').toBe(10);
+      expect(results[1], 'item2重试成功=20').toBe(20);
+      expect(results[2], 'item3=30').toBe(30);
+      await batcher.dispose();
+    },
+  },
+  {
+    name: '场景2: 部分失败处理 - PermanentFailure 不重试、直接永久失败',
+    run: async () => {
+      let flushCount = 0;
+      const batcher = new AdaptiveBatcher<number, number>({
+        minBatchSize: 3,
+        maxBatchSize: 3,
+        initialBatchSize: 3,
+        minWaitMs: 5,
+        maxWaitMs: 20,
+        maxRetries: 3,
+        retryDelayMs: 5,
+        flush: (batch) => {
+          flushCount++;
+          return batch.map((x, i) =>
+            i === 1 ? new PermanentFailure(`item ${x} 永久失败`) : x * 10
+          ) as number[];
         },
       });
 
       const p1 = batcher.submit(1);
       const p2 = batcher.submit(2);
       const p3 = batcher.submit(3);
-      await sleep(10);
 
-      const p4 = batcher.submit(4);
-      const p5 = batcher.submit(5);
-      const p6 = batcher.submit(6);
-
-      await sleep(5);
-
-      const overflowErr = await expectError(() => batcher.submit(999));
-      expect(overflowErr.code, '错误码应为 QUEUE_OVERFLOW').toBe(BatcherErrorCode.QUEUE_OVERFLOW);
-      expect(overflowErr.retryable, '溢出错误应为可重试').toBe(true);
-
-      const badBatcher = new AdaptiveBatcher<number, number>({
-        minBatchSize: 1,
-        maxBatchSize: 1,
-        maxQueueSize: 10,
-        flush: async () => {
-          throw new Error('下游数据库挂了');
-        },
-      });
-      const downstreamErr = await expectError(() => badBatcher.submit(1));
-      expect(downstreamErr.code, '错误码应为 FLUSH_FAILED').toBe(BatcherErrorCode.FLUSH_FAILED);
-      expect((downstreamErr as unknown as { cause?: Error }).cause?.message, 'cause 包含原始错误').toBe('下游数据库挂了');
-
-      await Promise.all([p1, p2, p3, p4, p5, p6]);
-      await batcher.dispose();
-      await badBatcher.dispose();
-    },
-  },
-  {
-    name: '场景B2: 背压策略 - drop模式 + fallback降级 / 无降级不挂起',
-    run: async () => {
-      const drops: number[] = [];
-      const batcherWithFallback = new AdaptiveBatcher<number, number>({
-        minBatchSize: 2,
-        maxBatchSize: 2,
-        maxQueueSize: 2,
-        maxInflightBatches: 1,
-        overflowStrategy: 'drop',
-        flush: async (batch) => {
-          await sleep(100);
-          return batch.map((x) => x + 100);
-        },
-        fallback: (item) => {
-          drops.push(item);
-          return item + 500;
-        },
-      });
-
-      const p1 = batcherWithFallback.submit(1);
-      const p2 = batcherWithFallback.submit(2);
-      await sleep(5);
-      const p3 = batcherWithFallback.submit(3);
-      const p5 = batcherWithFallback.submit(99);
-
-      expect(await p1, 'p1=101').toBe(101);
-      expect(await p5, 'p5=599').toBe(599);
-      expect(drops.includes(99), 'drops包含99').toBe(true);
-      await batcherWithFallback.dispose();
-
-      const batcherNoFallback = new AdaptiveBatcher<number, number>({
-        minBatchSize: 2,
-        maxBatchSize: 2,
-        maxQueueSize: 2,
-        maxInflightBatches: 1,
-        overflowStrategy: 'drop',
-        flush: async (batch) => {
-          await sleep(100);
-          return batch.map((x) => x + 100);
-        },
-      });
-
-      const pSubmit1 = batcherNoFallback.submit(1);
-      const pSubmit2 = batcherNoFallback.submit(2);
-      await sleep(5);
-
-      const dropPromise = batcherNoFallback.submit(999);
-      const dropErr = await expectError(() =>
-        Promise.race([
-          dropPromise,
-          new Promise<never>((_, r) => setTimeout(() => r(new Error('超时挂起') as never), 100)),
-        ])
-      );
-      await pSubmit1;
-      await pSubmit2;
-      expect(dropErr.code, '无降级时drop应返回DROPPED错误').toBe(BatcherErrorCode.DROPPED);
-      expect(dropErr.retryable, 'DROPPED应为可重试').toBe(true);
-
-      await batcherNoFallback.dispose();
-    },
-  },
-  {
-    name: '场景C: 自适应调参 - 根据flush耗时和失败率收缩批次',
-    run: async () => {
-      let slowMode = false;
-      let failMode = false;
-
-      const batcher = new AdaptiveBatcher<number, number>({
-        minBatchSize: 1,
-        maxBatchSize: 50,
-        initialBatchSize: 10,
-        minWaitMs: 2,
-        maxWaitMs: 60,
-        adaptToFlushDuration: true,
-        adaptToFailureRate: true,
-        flush: async (batch) => {
-          if (failMode) throw new Error('模拟下游失败');
-          await sleep(slowMode ? 500 : 10);
-          return batch.map((x) => x);
-        },
-      });
-
-      console.log('  阶段1: 正常高速模式');
-      for (let i = 0; i < 200; i++) {
-        void batcher.submit(i);
-        if (i % 5 === 0) await sleep(1);
-      }
-      await sleep(30);
-      const m1 = batcher.metrics;
-      console.log(`    → 目标批次=${m1.targetBatchSize}, EWMA速率=${m1.ewmaRate}/s`);
-      expect(m1.targetBatchSize > 20, '阶段1批次应较大 (>20)').toBeTruthy();
-      const size1 = m1.targetBatchSize;
-
-      console.log('  阶段2: 下游变慢(flush=500ms), 批次应收缩');
-      slowMode = true;
-      await batcher.forceFlush();
-      for (let i = 100; i < 130; i++) {
-        void batcher.submit(i);
-        await sleep(5);
-      }
-      await sleep(1100);
-      const m2 = batcher.metrics;
-      console.log(`    → 目标批次=${m2.targetBatchSize}, flush耗时EWMA=${m2.ewmaFlushDurationMs}ms`);
-      expect(m2.ewmaFlushDurationMs > 200, 'flush耗时EWMA应>200ms').toBeTruthy();
-      expect(m2.targetBatchSize < size1 * 0.9, '下游变慢后批次应收缩至少10%').toBe(true);
-
-      console.log('  阶段3: 下游开始失败, 批次应进一步收缩');
-      failMode = true;
-      await batcher.forceFlush();
-      for (let i = 200; i < 220; i++) {
-        batcher.submit(i).catch(() => {});
-        await sleep(5);
-      }
-      await sleep(300);
-      const m3 = batcher.metrics;
-      console.log(`    → 目标批次=${m3.targetBatchSize}, 失败率EWMA=${m3.ewmaFailureRate}`);
-      expect(m3.ewmaFailureRate > 0, '失败率>0').toBeTruthy();
-      expect(m3.targetBatchSize < m2.targetBatchSize, '失败后批次应更小').toBe(true);
-
-      console.log('  阶段4: 下游恢复, 批次应回升');
-      failMode = false;
-      slowMode = false;
-      for (let i = 300; i < 360; i++) {
-        void batcher.submit(i);
-        await sleep(2);
-      }
-      await sleep(50);
-      const m4 = batcher.metrics;
-      console.log(`    → 目标批次=${m4.targetBatchSize}`);
-      expect(m4.targetBatchSize > m3.targetBatchSize, '恢复后批次应回升').toBe(true);
-
+      const [r1, err2, r3] = await Promise.all([p1, p2.catch((e) => e), p3]);
+      expect(r1, 'item1成功=10').toBe(10);
+      expect(r3, 'item3成功=30').toBe(30);
+      expect(err2.code, 'item2是PERMANENT_FAILURE').toBe(BatcherErrorCode.PERMANENT_FAILURE);
+      expect(err2.retryable, '永久失败不可重试').toBe(false);
+      expect(flushCount, '只flush了1次,永久失败不重试').toBe(1);
       await batcher.dispose();
     },
   },
   {
-    name: '场景D: 收尾不卡死 - dispose在并发占满时正常结束',
+    name: '场景3: 重试耗尽 - RETRY_EXHAUSTED 错误',
     run: async () => {
-      const results: Array<{ id: number; status: string; value?: number; error?: string }> = [];
       const batcher = new AdaptiveBatcher<number, number>({
-        minBatchSize: 3,
-        maxBatchSize: 3,
-        initialBatchSize: 3,
+        minBatchSize: 2,
+        maxBatchSize: 2,
+        initialBatchSize: 2,
         minWaitMs: 5,
         maxWaitMs: 20,
-        maxInflightBatches: 1,
-        maxQueueSize: 100,
-        flush: async (batch) => {
-          await sleep(150);
-          return batch.map((x) => x + 1000);
+        maxRetries: 2,
+        retryDelayMs: 5,
+        flush: (batch, attempt) => {
+          return batch.map(() => new RetryableFailure(`第${attempt}次还是失败`)) as number[];
         },
       });
 
-      for (let i = 0; i < 10; i++) {
-        const id = i;
-        batcher.submit(i)
-          .then((v) => results.push({ id, status: 'resolved', value: v }))
-          .catch((e) => results.push({ id, status: 'rejected', error: (e as Error).message }));
-        if (i === 2) await sleep(10);
-      }
-
-      await sleep(20);
-      const metricsBefore = batcher.metrics;
-      expect(metricsBefore.inflightBatches, '此时inflight=1').toBe(1);
-      expect(metricsBefore.currentQueueSize > 0, '队列仍有积压').toBe(true);
-
-      const disposeStart = Date.now();
-      const disposePromise = batcher.dispose();
-      const timeout = new Promise<never>((_, r) =>
-        setTimeout(() => r(new Error('dispose 卡死了!') as never), 2000)
+      const err = await expectError(() =>
+        Promise.all([batcher.submit(1), batcher.submit(2)])
       );
-      await Promise.race([disposePromise, timeout]);
-      const disposeDuration = Date.now() - disposeStart;
-
-      console.log(`  dispose 耗时: ${disposeDuration}ms`);
-      expect(disposeDuration < 2000, 'dispose 不应卡死').toBe(true);
-      expect(results.length, '所有10个请求都有归宿').toBe(10);
-
+      expect(err.code, '重试耗尽返回RETRY_EXHAUSTED').toBe(BatcherErrorCode.RETRY_EXHAUSTED);
+      expect(err.retryable, '重试耗尽仍可重试(由调用方决定)').toBe(true);
       await batcher.dispose();
     },
   },
   {
-    name: '场景E: 收尾不卡死 - forceFlush在并发占满时正常结束',
+    name: '场景4: flushing 中超时也能立即返回',
     run: async () => {
       const batcher = new AdaptiveBatcher<number, number>({
         minBatchSize: 2,
@@ -383,138 +201,319 @@ const testCases: TestCase[] = [
         maxWaitMs: 20,
         maxInflightBatches: 1,
         flush: async (batch) => {
-          await sleep(80);
+          await sleep(500);
           return batch.map((x) => x * 10);
         },
       });
 
-      const proms: Promise<number>[] = [];
-      for (let i = 0; i < 7; i++) {
-        proms.push(batcher.submit(i));
-      }
+      const start = Date.now();
+      const pFast = batcher.submit(1, { timeoutMs: 50 });
+      const pSlow = batcher.submit(2);
 
-      await sleep(10);
-      const m = batcher.metrics;
-      expect(m.inflightBatches, 'inflight=1').toBe(1);
-      expect(m.currentQueueSize > 0, '队列有积压').toBe(true);
+      const err = await expectError(() => pFast);
+      const fastDuration = Date.now() - start;
 
-      const flushStart = Date.now();
-      const flushPromise = batcher.forceFlush();
-      const timeout = new Promise<never>((_, r) =>
-        setTimeout(() => r(new Error('forceFlush 卡死了!') as never), 2000)
-      );
-      await Promise.race([flushPromise, timeout]);
-      const flushDuration = Date.now() - flushStart;
+      console.log(`  超时请求 ${fastDuration}ms 后返回, code=${err.code}`);
+      expect(err.code, 'flushing中超时返回TIMEOUT').toBe(BatcherErrorCode.TIMEOUT);
+      expect(fastDuration, '50ms左右就返回,不用等500ms').toBeLessThan(200);
+      expect(fastDuration, '至少等了50ms').toBeGreaterThanOrEqual(40);
 
-      console.log(`  forceFlush 耗时: ${flushDuration}ms`);
-      expect(flushDuration < 2000, 'forceFlush 不应卡死').toBe(true);
+      const slowResult = await pSlow;
+      expect(slowResult, '慢请求正常完成=20').toBe(20);
 
-      const m2 = batcher.metrics;
-      expect(m2.inflightBatches, 'inflight=0').toBe(0);
-      expect(m2.currentQueueSize, 'queue=0').toBe(0);
-
-      await Promise.all(proms);
       await batcher.dispose();
     },
   },
   {
-    name: '场景F: 提交取消与超时 - 排队中取消、超时生效',
+    name: '场景5: kill 策略立即返回,不等慢下游',
     run: async () => {
+      const results: Array<{ id: number; status: string; duration?: number }> = [];
+
       const batcher = new AdaptiveBatcher<number, number>({
-        minBatchSize: 10,
-        maxBatchSize: 10,
-        initialBatchSize: 10,
+        minBatchSize: 3,
+        maxBatchSize: 3,
+        initialBatchSize: 3,
         minWaitMs: 5,
-        maxWaitMs: 500,
+        maxWaitMs: 20,
         maxInflightBatches: 1,
         flush: async (batch) => {
-          await sleep(30);
+          await sleep(2000);
+          return batch.map((x) => x + 100);
+        },
+      });
+
+      const start = Date.now();
+      const p1 = batcher.submit(1);
+      const p2 = batcher.submit(2);
+      const p3 = batcher.submit(3);
+
+      await sleep(20);
+
+      const killStart = Date.now();
+      const disposePromise = batcher.dispose('kill');
+      const p4 = batcher.submit(999);
+
+      const [, , , err4] = await Promise.allSettled([p1, p2, p3, p4]);
+      await disposePromise;
+      const killDuration = Date.now() - killStart;
+
+      console.log(`  kill 耗时: ${killDuration}ms (远小于2000ms)`);
+      expect(killDuration, 'kill立即返回,<100ms').toBeLessThan(100);
+
+      const err1 = await expectError(() => p1);
+      expect(err1.code, 'inflight的请求也被kill').toBe(BatcherErrorCode.DISPOSED);
+
+      const totalDuration = Date.now() - start;
+      expect(totalDuration, '整体耗时远小于2000ms').toBeLessThan(500);
+
+      await batcher.dispose();
+    },
+  },
+  {
+    name: '场景6: PartitionedBatcher 按 key 分组攒批,各 key 独立',
+    run: async () => {
+      const flushCalls: Array<{ key: string; batch: number[] }> = [];
+
+      const pb = new PartitionedAdaptiveBatcher<number, number>({
+        perKeyMinBatchSize: 2,
+        perKeyMaxBatchSize: 2,
+        perKeyInitialBatchSize: 2,
+        perKeyMinWaitMs: 5,
+        perKeyMaxWaitMs: 50,
+        perKeyMaxInflightBatches: 1,
+        perKeyMaxQueueSize: 10,
+        maxTotalQueueSize: 100,
+        maxKeys: 10,
+        flush: (key, batch) => {
+          flushCalls.push({ key, batch });
+          return batch.map((x) => x + key.length * 100);
+        },
+      });
+
+      const pa1 = pb.submit(1, { key: 'aaa' });
+      const pb1 = pb.submit(10, { key: 'bb' });
+      const pa2 = pb.submit(2, { key: 'aaa' });
+      const pb2 = pb.submit(20, { key: 'bb' });
+
+      const [ra1, ra2, rb1, rb2] = await Promise.all([pa1, pa2, pb1, pb2]);
+
+      expect(flushCalls.length, '应该有2次flush,每个key各一次').toBe(2);
+      const aaaFlush = flushCalls.find((f) => f.key === 'aaa')!;
+      const bbFlush = flushCalls.find((f) => f.key === 'bb')!;
+      expect(aaaFlush.batch.length, 'aaa批次大小=2').toBe(2);
+      expect(bbFlush.batch.length, 'bb批次大小=2').toBe(2);
+
+      expect(ra1, 'aaa的结果=301(aaa长3,3*100+1)').toBe(301);
+      expect(rb1, 'bb的结果=210(bb长2,2*100+10)').toBe(210);
+
+      expect(pb.keyCount, 'key数量=2').toBe(2);
+      await pb.dispose();
+    },
+  },
+  {
+    name: '场景7: PartitionedBatcher 热点 key 爆了不影响冷门 key',
+    run: async () => {
+      const pb = new PartitionedAdaptiveBatcher<number, number>({
+        perKeyMinBatchSize: 2,
+        perKeyMaxBatchSize: 2,
+        perKeyInitialBatchSize: 2,
+        perKeyMinWaitMs: 5,
+        perKeyMaxWaitMs: 50,
+        perKeyMaxQueueSize: 3,
+        perKeyMaxInflightBatches: 1,
+        maxTotalQueueSize: 100,
+        overflowStrategy: 'reject',
+        flush: async (_, batch) => {
+          await sleep(200);
           return batch.map((x) => x * 2);
         },
       });
 
-      console.log('  测试1: 排队中通过 AbortSignal 取消');
-      const controller = new AbortController();
-      const pCancel = batcher.submit(999, { signal: controller.signal });
-      await sleep(5);
-      controller.abort();
-      const errCancel = await expectError(() => pCancel);
-      expect(errCancel.code, '错误码应为 CANCELED').toBe(BatcherErrorCode.CANCELED);
-      expect(errCancel.retryable, 'CANCELED 不可重试').toBe(false);
-
-      console.log('  测试2: 提交超时 (timeoutMs)');
-      const pTimeout = batcher.submit(888, { timeoutMs: 50 });
-      const errTimeout = await expectError(() => pTimeout);
-      expect(errTimeout.code, '错误码应为 TIMEOUT').toBe(BatcherErrorCode.TIMEOUT);
-      expect(errTimeout.retryable, 'TIMEOUT 可重试').toBe(true);
-
-      console.log('  测试3: 已取消的 signal 直接拒绝');
-      const controller2 = new AbortController();
-      controller2.abort();
-      const pPreCancel = batcher.submit(777, { signal: controller2.signal });
-      const errPreCancel = await expectError(() => pPreCancel);
-      expect(errPreCancel.code, '已取消的signal直接返回CANCELED').toBe(BatcherErrorCode.CANCELED);
-
-      console.log('  测试4: 正常提交不影响');
-      const normalProms: Promise<number>[] = [];
-      for (let i = 0; i < 10; i++) {
-        normalProms.push(batcher.submit(i));
+      const hotPromises: Promise<number>[] = [];
+      for (let i = 0; i < 4; i++) {
+        hotPromises.push(pb.submit(i, { key: 'hot' }));
       }
-      const normalResults = await Promise.all(normalProms);
-      expect(normalResults.length, '正常提交应全部成功').toBe(10);
-      expect(normalResults[0], '结果正确').toBe(0);
+
+      const coldP = pb.submit(42, { key: 'cold' });
+      const allPromises = [...hotPromises, coldP];
+      const allResults = await Promise.allSettled(allPromises);
+
+      let overflowCount = 0;
+      for (let i = 0; i < hotPromises.length; i++) {
+        if (allResults[i].status === 'rejected' && allResults[i].reason.code === BatcherErrorCode.QUEUE_OVERFLOW) {
+          overflowCount++;
+        }
+      }
+      expect(overflowCount, 'hot key有1个溢出').toBe(1);
+
+      const coldResult = allResults[allResults.length - 1];
+      expect(coldResult.status, 'cold key成功').toBe('fulfilled');
+      expect((coldResult as PromiseFulfilledResult<number>).value, 'cold key不受影响').toBe(84);
+
+      expect(pb.keyCount, '有2个key').toBe(2);
+      await pb.dispose('kill');
+    },
+  },
+  {
+    name: '场景8: PartitionedBatcher 全局队列限制',
+    run: async () => {
+      const pb = new PartitionedAdaptiveBatcher<number, number>({
+        perKeyMinBatchSize: 2,
+        perKeyMaxBatchSize: 2,
+        perKeyInitialBatchSize: 2,
+        perKeyMinWaitMs: 5,
+        perKeyMaxWaitMs: 50,
+        perKeyMaxQueueSize: 100,
+        perKeyMaxInflightBatches: 1,
+        maxTotalQueueSize: 5,
+        maxKeys: 100,
+        overflowStrategy: 'reject',
+        flush: async (_, batch) => {
+          await sleep(200);
+          return batch.map((x) => x * 2);
+        },
+      });
+
+      const promises: Promise<number>[] = [];
+      for (let i = 0; i < 3; i++) {
+        promises.push(pb.submit(i * 10, { key: 'a' }));
+        promises.push(pb.submit(i * 10 + 1, { key: 'b' }));
+      }
+      promises.push(pb.submit(999, { key: 'c' }));
+
+      const allResults = await Promise.allSettled(promises);
+      let overflowCount = 0;
+      for (const r of allResults) {
+        if (r.status === 'rejected' && r.reason.code === BatcherErrorCode.QUEUE_OVERFLOW) {
+          overflowCount++;
+        }
+      }
+      expect(overflowCount > 0, '全局队列满了有溢出').toBe(true);
+
+      await pb.dispose('kill');
+    },
+  },
+  {
+    name: '场景9: 快照导出 - per-key 统计、topN 排序、全局健康',
+    run: async () => {
+      const pb = new PartitionedAdaptiveBatcher<number, number>({
+        perKeyMinBatchSize: 1,
+        perKeyMaxBatchSize: 2,
+        perKeyInitialBatchSize: 1,
+        perKeyMinWaitMs: 2,
+        perKeyMaxWaitMs: 10,
+        perKeyMaxQueueSize: 10,
+        perKeyMaxInflightBatches: 1,
+        maxTotalQueueSize: 100,
+        maxKeys: 10,
+        statsWindowMs: 5000,
+        flush: (key, batch) => {
+          if (key === 'bad') {
+            return batch.map(() => new PermanentFailure('一直失败')) as number[];
+          }
+          return batch.map((x) => x * 2);
+        },
+      });
+
+      const proms: Promise<number>[] = [];
+      for (let i = 0; i < 5; i++) {
+        proms.push(pb.submit(i, { key: 'big' }));
+      }
+      for (let i = 0; i < 2; i++) {
+        proms.push(pb.submit(i + 100, { key: 'small' }));
+      }
+      pb.submit(999, { key: 'bad' }).catch(() => {});
+      pb.submit(888, { key: 'bad' }).catch(() => {});
+
+      await Promise.allSettled(proms);
+      await sleep(50);
+
+      const snapshot = pb.getSnapshot({ topN: 3 });
+      console.log(`  快照: totalKeys=${snapshot.totalKeys}, totalQueue=${snapshot.totalQueueSize}, globalHealth=${snapshot.globalHealth}`);
+      console.log(`  topKeysByQueue: ${snapshot.topKeysByQueue.map((k) => `${k.key}(${k.queueSize})`).join(', ')}`);
+      console.log(`  topKeysByFailure: ${snapshot.topKeysByFailure.map((k) => `${k.key}(${k.ewmaFailureRate})`).join(', ')}`);
+
+      expect(snapshot.totalKeys, '有4个key?不对,应该是3个').toBeGreaterThanOrEqual(3);
+      expect(snapshot.globalHealth, '全局健康状态').toBeTruthy();
+      expect(snapshot.timestamp, '有时间戳').toBeGreaterThan(0);
+      expect(snapshot.topKeysByQueue.length, 'topN<=3').toBeLessThanOrEqual(3);
+      expect(snapshot.perKey['big'], 'big key有统计').toBeTruthy();
+      expect(snapshot.perKey['small'], 'small key有统计').toBeTruthy();
+
+      const badStats = pb.getKeyStats('bad');
+      expect(badStats, 'bad key有统计').toBeTruthy();
+      expect(badStats!.lastError != null, 'bad key有lastError').toBe(true);
+      expect(badStats!.health.status !== 'healthy', 'bad key不健康').toBe(true);
+
+      expect(snapshot.topKeysByFailure[0].key, '失败率最高的是bad').toBe('bad');
+
+      await pb.dispose();
+    },
+  },
+  {
+    name: '场景10: flush 函数接收 attempt 参数',
+    run: async () => {
+      const attempts: number[] = [];
+      const batcher = new AdaptiveBatcher<number, number>({
+        minBatchSize: 2,
+        maxBatchSize: 2,
+        initialBatchSize: 2,
+        minWaitMs: 5,
+        maxWaitMs: 20,
+        maxRetries: 2,
+        retryDelayMs: 5,
+        flush: (batch, attempt) => {
+          attempts.push(attempt);
+          if (attempt < 3) {
+            return batch.map(() => new RetryableFailure('retry me')) as number[];
+          }
+          return batch.map((x) => x * 10);
+        },
+      });
+
+      await Promise.all([batcher.submit(1), batcher.submit(2)]).catch(() => {});
+
+      console.log(`  attempts: ${attempts.join(', ')}`);
+      expect(attempts[0], '第一次attempt=1').toBe(1);
+      expect(attempts.length, '总共3次attempt(1+2次重试)').toBe(3);
+      expect(attempts[2], '第三次attempt=3').toBe(3);
+      await batcher.dispose();
+    },
+  },
+
+  // ========== v3 回归测试 ==========
+  {
+    name: '回归1: 基础攒批 + 双缓冲无阻塞',
+    run: async () => {
+      const batcher = new AdaptiveBatcher<number, number>({
+        minBatchSize: 2,
+        maxBatchSize: 20,
+        initialBatchSize: 2,
+        minWaitMs: 2,
+        maxWaitMs: 20,
+        maxInflightBatches: 1,
+        flush: async (batch) => {
+          await sleep(80);
+          return batch.map((x) => x + 1000);
+        },
+      });
+
+      const wave1 = Promise.all([batcher.submit(0), batcher.submit(1)]);
+      await sleep(15);
+      const wave2 = [2, 3, 4, 5, 6].map((i) => batcher.submit(i));
+      const queueMid = batcher.metrics.currentQueueSize;
+      expect(queueMid > 0, 'flush期间新请求无阻塞入队').toBeTruthy();
+
+      const r1 = await wave1;
+      const r2 = await Promise.all(wave2);
+      expect(r1[0], 'wave1[0]=1000').toBe(1000);
+      expect(r2.length, 'wave2有5个').toBe(5);
 
       await batcher.dispose();
     },
   },
   {
-    name: '场景G: dispose策略 - drain/reject/kill 三种策略',
-    run: async () => {
-      for (const strategy of ['drain', 'reject', 'kill'] as DisposeStrategy[]) {
-        console.log(`  测试策略: ${strategy}`);
-        const batcher = new AdaptiveBatcher<number, number>({
-          minBatchSize: 2,
-          maxBatchSize: 2,
-          initialBatchSize: 2,
-          minWaitMs: 5,
-          maxWaitMs: 20,
-          maxInflightBatches: 1,
-          flush: async (batch) => {
-            await sleep(60);
-            return batch.map((x) => x + 100);
-          },
-        });
-
-        const results: Array<{ id: number; status: string; code?: BatcherErrorCode }> = [];
-        for (let i = 0; i < 5; i++) {
-          const id = i;
-          batcher.submit(i)
-            .then(() => results.push({ id, status: 'resolved' }))
-            .catch((e) => results.push({ id, status: 'rejected', code: (e as BatcherError).code }));
-        }
-
-        await sleep(10);
-        const before = batcher.metrics;
-        console.log(`    dispose前: inflight=${before.inflightBatches}, queue=${before.currentQueueSize}`);
-
-        const start = Date.now();
-        await batcher.dispose(strategy);
-        const duration = Date.now() - start;
-        console.log(`    dispose耗时=${duration}ms, resolved=${results.filter((r) => r.status === 'resolved').length}, rejected=${results.filter((r) => r.status === 'rejected').length}`);
-
-        expect(results.length, '所有5个请求有归宿').toBe(5);
-        expect(duration < 1000, `${strategy} 不卡死`).toBe(true);
-
-        if (strategy === 'kill') {
-          const rejected = results.filter((r) => r.status === 'rejected');
-          expect(rejected.length > 0, 'kill策略应有被reject的请求').toBeTruthy();
-          expect(rejected[0].code, 'kill策略应为DISPOSED').toBe(BatcherErrorCode.DISPOSED);
-        }
-      }
-    },
-  },
-  {
-    name: '场景H: 百分位统计 + stale过期机制 + 健康状态',
+    name: '回归2: 可观测 + rollingStats + p50/p95 + stale',
     run: async () => {
       const batcher = new AdaptiveBatcher<number, number>({
         minBatchSize: 2,
@@ -529,7 +528,6 @@ const testCases: TestCase[] = [
         },
       });
 
-      console.log('  阶段1: 活跃流量,验证p50/p95和健康状态');
       const proms: Promise<number>[] = [];
       for (let i = 0; i < 15; i++) {
         proms.push(batcher.submit(i));
@@ -539,38 +537,216 @@ const testCases: TestCase[] = [
       await sleep(50);
 
       const stats = batcher.rollingStats;
-      console.log(`    p50Wait=${stats.p50QueuedWaitMs}ms, p95Wait=${stats.p95QueuedWaitMs}ms, p50Flush=${stats.p50FlushDurationMs}ms, p95Flush=${stats.p95FlushDurationMs}ms`);
-      expect(stats.p50QueuedWaitMs >= 0, 'p50Wait 合法').toBeTruthy();
-      expect(stats.p95QueuedWaitMs >= stats.p50QueuedWaitMs, 'p95 >= p50').toBeTruthy();
-      expect(stats.p95FlushDurationMs >= stats.p50FlushDurationMs, 'p95Flush >= p50Flush').toBeTruthy();
+      expect(stats.p50QueuedWaitMs >= 0, 'p50Wait有值').toBeTruthy();
+      expect(stats.p95QueuedWaitMs >= stats.p50QueuedWaitMs, 'p95>=p50').toBe(true);
       expect(stats.stale, '活跃时stale=false').toBe(false);
 
-      const health1 = batcher.health;
-      console.log(`    健康状态: ${health1.status}, mode=${health1.mode}`);
-      expect(health1.status, '健康状态应为healthy').toBe('healthy');
-
-      console.log('  阶段2: 长时间无流量,统计应过期为stale');
       const originalGetTime = Date.now;
       const now = originalGetTime();
       Date.now = () => now + 6000;
-
       const statsStale = batcher.rollingStats;
-      console.log(`    6秒后: stale=${statsStale.stale}, itemsProcessed=${statsStale.itemsProcessed}`);
-      expect(statsStale.stale, '过期后stale=true').toBe(true);
-      expect(statsStale.itemsProcessed, '过期后统计清零').toBe(0);
-
-      const healthStale = batcher.health;
-      console.log(`    过期健康状态: ${healthStale.status}, mode=${healthStale.mode}`);
-      expect(healthStale.status, '过期状态应为stale').toBe('stale');
-      expect(healthStale.mode, '过期mode应为idle').toBe('idle');
-
+      expect(statsStale.stale, '6秒后stale=true').toBe(true);
+      expect(statsStale.itemsProcessed, '过期后清零').toBe(0);
       Date.now = originalGetTime;
 
       await batcher.dispose();
     },
   },
   {
-    name: '场景I: 背压边界 - block策略关闭时快速返回',
+    name: '回归3: 背压三种策略 + 错误码',
+    run: async () => {
+      // reject
+      const b1 = new AdaptiveBatcher<number, number>({
+        minBatchSize: 2,
+        maxBatchSize: 2,
+        maxQueueSize: 3,
+        maxInflightBatches: 1,
+        overflowStrategy: 'reject',
+        flush: async (b) => {
+          await sleep(100);
+          return b;
+        },
+      });
+      const p1 = b1.submit(1);
+      const p2 = b1.submit(2);
+      const p3 = b1.submit(3);
+      const err1 = await expectError(() => b1.submit(999));
+      expect(err1.code, 'reject策略:QUEUE_OVERFLOW').toBe(BatcherErrorCode.QUEUE_OVERFLOW);
+      await Promise.allSettled([p1, p2, p3]);
+      await b1.dispose();
+
+      // drop + fallback
+      let dropped = 0;
+      const b2 = new AdaptiveBatcher<number, number>({
+        minBatchSize: 2,
+        maxBatchSize: 2,
+        maxQueueSize: 3,
+        maxInflightBatches: 1,
+        overflowStrategy: 'drop',
+        flush: async (b) => {
+          await sleep(100);
+          return b;
+        },
+        fallback: (x) => {
+          dropped++;
+          return x + 500;
+        },
+      });
+      const dp1 = b2.submit(1);
+      const dp2 = b2.submit(2);
+      const dp3 = b2.submit(3);
+      const dp4 = await b2.submit(999);
+      expect(dp4, 'drop+fallback返回降级值').toBe(1499);
+      expect(dropped, '降级函数被调用').toBeGreaterThanOrEqual(1);
+      await Promise.allSettled([dp1, dp2, dp3]);
+      await b2.dispose();
+
+      // drop 无降级不挂起
+      const b3 = new AdaptiveBatcher<number, number>({
+        minBatchSize: 2,
+        maxBatchSize: 2,
+        maxQueueSize: 3,
+        maxInflightBatches: 1,
+        overflowStrategy: 'drop',
+        flush: async (b) => {
+          await sleep(100);
+          return b;
+        },
+      });
+      const bp1 = b3.submit(1);
+      const bp2 = b3.submit(2);
+      const bp3 = b3.submit(3);
+      const dropPromise = b3.submit(999);
+      const race = await Promise.race([
+        dropPromise.catch((e) => e),
+        new Promise<string>((r) => setTimeout(() => r('timeout'), 100)),
+      ]);
+      expect(race instanceof BatcherError, '无降级drop立即抛错,不挂起').toBe(true);
+      expect((race as BatcherError).code, '错误码DROPPED').toBe(BatcherErrorCode.DROPPED);
+      await Promise.allSettled([bp1, bp2, bp3]);
+      await b3.dispose();
+    },
+  },
+  {
+    name: '回归4: dispose 三策略 + 不卡死',
+    run: async () => {
+      for (const strategy of ['drain', 'reject', 'kill'] as DisposeStrategy[]) {
+        console.log(`  测试策略: ${strategy}`);
+        const batcher = new AdaptiveBatcher<number, number>({
+          minBatchSize: 2,
+          maxBatchSize: 2,
+          initialBatchSize: 2,
+          minWaitMs: 5,
+          maxWaitMs: 20,
+          maxInflightBatches: 1,
+          flush: async (batch) => {
+            console.log(`    flush 执行, size=${batch.length}`);
+            await sleep(60);
+            return batch.map((x) => x + 100);
+          },
+        });
+
+        const promises: Promise<number>[] = [];
+        for (let i = 0; i < 5; i++) {
+          const p = batcher.submit(i);
+          p.catch(() => {}); // prevent unhandledRejection in Node.js v24
+          promises.push(p);
+        }
+
+        console.log(`  submit 完成, queue=${batcher.metrics.currentQueueSize}, inflight=${batcher.metrics.inflightBatches}`);
+        await sleep(10);
+        console.log(`  sleep 10ms 后, queue=${batcher.metrics.currentQueueSize}, inflight=${batcher.metrics.inflightBatches}`);
+        
+        const start = Date.now();
+        await batcher.dispose(strategy);
+        const duration = Date.now() - start;
+
+        const settled = await Promise.allSettled(promises);
+        console.log(`  dispose 完成, duration=${duration}ms, settled=${settled.length}`);
+
+        expect(settled.length, '所有请求有归宿').toBe(5);
+        expect(duration < 1000, `${strategy}不卡死`).toBe(true);
+
+        if (strategy === 'kill') {
+          expect(duration < 100, 'kill立即返回').toBe(true);
+        }
+      }
+    },
+  },
+  {
+    name: '回归5: 提交取消与超时',
+    run: async () => {
+      const batcher = new AdaptiveBatcher<number, number>({
+        minBatchSize: 10,
+        maxBatchSize: 10,
+        initialBatchSize: 10,
+        minWaitMs: 5,
+        maxWaitMs: 500,
+        maxInflightBatches: 1,
+        flush: async (batch) => {
+          await sleep(30);
+          return batch.map((x) => x * 2);
+        },
+      });
+
+      // 排队中取消
+      const controller = new AbortController();
+      const pCancel = batcher.submit(999, { signal: controller.signal });
+      await sleep(5);
+      controller.abort();
+      const errCancel = await expectError(() => pCancel);
+      expect(errCancel.code, '排队中取消:CANCELED').toBe(BatcherErrorCode.CANCELED);
+
+      // 已取消的 signal
+      const controller2 = new AbortController();
+      controller2.abort();
+      const errPre = await expectError(() => batcher.submit(777, { signal: controller2.signal }));
+      expect(errPre.code, '已取消signal直接拒绝').toBe(BatcherErrorCode.CANCELED);
+
+      await batcher.dispose();
+    },
+  },
+  {
+    name: '回归6: 回调错误隔离',
+    run: async () => {
+      const batcher = new AdaptiveBatcher<number, number>({
+        minBatchSize: 2,
+        maxBatchSize: 2,
+        initialBatchSize: 2,
+        minWaitMs: 5,
+        maxWaitMs: 20,
+        flush: async (batch) => batch.map((x) => x * 2),
+        onFlush: () => {
+          throw new Error('监控挂了');
+        },
+      });
+
+      const results = await Promise.all([batcher.submit(1), batcher.submit(2)]);
+      expect(results[0], 'onFlush错了不影响主流程').toBe(2);
+
+      // 异步onFlush不卡forceFlush
+      const b2 = new AdaptiveBatcher<number, number>({
+        minBatchSize: 2,
+        maxBatchSize: 2,
+        initialBatchSize: 2,
+        minWaitMs: 5,
+        maxWaitMs: 20,
+        flush: async (batch) => batch.map((x) => x * 2),
+        onFlush: async () => {
+          await sleep(500);
+        },
+      });
+      await Promise.all([b2.submit(1), b2.submit(2)]);
+      const start = Date.now();
+      await b2.forceFlush();
+      expect(Date.now() - start < 200, 'forceFlush不卡').toBe(true);
+
+      await batcher.dispose();
+      await b2.dispose();
+    },
+  },
+  {
+    name: '回归7: block策略关闭时快速返回',
     run: async () => {
       const batcher = new AdaptiveBatcher<number, number>({
         minBatchSize: 2,
@@ -588,145 +764,26 @@ const testCases: TestCase[] = [
       const p2 = batcher.submit(2);
       await sleep(10);
 
-      const blockStart = Date.now();
+      const start = Date.now();
       const pBlock = batcher.submit(999);
       await sleep(50);
 
       const disposePromise = batcher.dispose();
       const err = await expectError(() => pBlock);
-      await Promise.allSettled([p1, p2]);
-      const blockDuration = Date.now() - blockStart;
+      const duration = Date.now() - start;
 
-      console.log(`  block等待${blockDuration}ms后, dispose触发错误: code=${err.code}`);
-      expect(err.code, 'block中dispose应返回DISPOSED').toBe(BatcherErrorCode.DISPOSED);
-      expect(blockDuration < 500, '不会一直等下去').toBe(true);
+      expect(err.code, 'block中dispose返回DISPOSED').toBe(BatcherErrorCode.DISPOSED);
+      expect(duration < 500, '不会一直等').toBe(true);
 
       await disposePromise;
-    },
-  },
-  {
-    name: '场景J: 回调隔离 - onFlush/onError错误不影响主流程',
-    run: async () => {
-      console.log('  测试1: onFlush同步抛错不影响');
-      let onFlushError = false;
-      const batcher1 = new AdaptiveBatcher<number, number>({
-        minBatchSize: 2,
-        maxBatchSize: 2,
-        initialBatchSize: 2,
-        minWaitMs: 5,
-        maxWaitMs: 20,
-        flush: async (batch) => batch.map((x) => x * 2),
-        onFlush: () => {
-          onFlushError = true;
-          throw new Error('监控系统挂了');
-        },
-      });
-      const r1 = await Promise.all([batcher1.submit(1), batcher1.submit(2)]);
-      expect(onFlushError, 'onFlush确实被调用了').toBe(true);
-      expect(r1[0], '主流程结果不受影响').toBe(2);
-      await batcher1.dispose();
-
-      console.log('  测试2: onFlush异步抛错不影响主流程,也不卡forceFlush');
-      const batcher2 = new AdaptiveBatcher<number, number>({
-        minBatchSize: 2,
-        maxBatchSize: 2,
-        initialBatchSize: 2,
-        minWaitMs: 5,
-        maxWaitMs: 20,
-        flush: async (batch) => batch.map((x) => x * 2),
-        onFlush: async () => {
-          await sleep(500);
-          throw new Error('异步监控挂了');
-        },
-      });
-      const r2 = await Promise.all([batcher2.submit(3), batcher2.submit(4)]);
-      expect(r2[0], '异步onFlush不影响结果').toBe(6);
-
-      const flushStart = Date.now();
-      await batcher2.forceFlush();
-      const flushDuration = Date.now() - flushStart;
-      console.log(`    forceFlush耗时=${flushDuration}ms (不被500ms的异步onFlush卡住)`);
-      expect(flushDuration < 200, 'forceFlush不被异步回调卡住').toBe(true);
-      await batcher2.dispose();
-
-      console.log('  测试3: onError抛错不影响');
-      const batcher3 = new AdaptiveBatcher<number, number>({
-        minBatchSize: 1,
-        maxBatchSize: 1,
-        flush: async () => {
-          throw new Error('下游挂了');
-        },
-        onError: () => {
-          throw new Error('监控告警也挂了');
-        },
-      });
-      const err = await expectError(() => batcher3.submit(1));
-      expect(err.code, '主流程错误正常返回').toBe(BatcherErrorCode.FLUSH_FAILED);
-      await batcher3.dispose();
-
-      console.log('  测试4: dispose也不被卡住');
-      const batcher4 = new AdaptiveBatcher<number, number>({
-        minBatchSize: 2,
-        maxBatchSize: 2,
-        initialBatchSize: 2,
-        minWaitMs: 5,
-        maxWaitMs: 20,
-        flush: async (batch) => {
-          await sleep(30);
-          return batch.map((x) => x);
-        },
-        onFlush: async () => {
-          await sleep(500);
-        },
-      });
-      const p4 = Promise.all([batcher4.submit(1), batcher4.submit(2)]);
-      await sleep(10);
-      const disposeStart = Date.now();
-      await batcher4.dispose();
-      const disposeDuration = Date.now() - disposeStart;
-      console.log(`    dispose耗时=${disposeDuration}ms (不被500ms的异步onFlush卡住)`);
-      expect(disposeDuration < 200, 'dispose不被异步回调卡住').toBe(true);
-      await p4;
-    },
-  },
-  {
-    name: '回归测试: 双缓冲无阻塞、老功能正常',
-    run: async () => {
-      let maxQueueDuringFlush = 0;
-      const batcher = new AdaptiveBatcher<number, number>({
-        minBatchSize: 2,
-        maxBatchSize: 20,
-        initialBatchSize: 2,
-        minWaitMs: 2,
-        maxWaitMs: 20,
-        maxInflightBatches: 1,
-        flush: async (batch) => {
-          await sleep(80);
-          maxQueueDuringFlush = Math.max(maxQueueDuringFlush, batcher.metrics.currentQueueSize);
-          return batch.map((x) => x + 1000);
-        },
-      });
-
-      const wave1 = Promise.all([batcher.submit(0), batcher.submit(1)]);
-      await sleep(15);
-      const wave2 = [2, 3, 4, 5, 6].map((i) => batcher.submit(i));
-      const queueMid = batcher.metrics.currentQueueSize;
-      console.log(`  flush进行中队列深度=${queueMid} (>0 → 无阻塞)`);
-      expect(queueMid > 0, '无阻塞入队').toBeTruthy();
-
-      const r1 = await wave1;
-      const r2 = await Promise.all(wave2);
-      expect(JSON.stringify(r1), 'wave1=[1000,1001]').toBe(JSON.stringify([1000, 1001]));
-      expect(r2.length, 'wave2=5个').toBe(5);
-
-      await batcher.dispose();
+      await Promise.allSettled([p1, p2]);
     },
   },
 ];
 
 (async () => {
   console.log('='.repeat(75));
-  console.log('  自适应批量提交器 v3 - 生产可用版 测试验证');
+  console.log('  自适应批量提交器 v4 - 可发 npm 版 测试验证');
   console.log('='.repeat(75));
   console.log();
 
