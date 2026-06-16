@@ -11,6 +11,8 @@ import {
   HealthStatus,
   KeyStats,
   PartitionedSnapshot,
+  SubmitTrace,
+  CircuitBreakerState,
 } from './adaptive-batcher';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -779,11 +781,327 @@ const testCases: TestCase[] = [
       await Promise.allSettled([p1, p2]);
     },
   },
+  {
+    name: '场景11: v5 请求追踪 - trace 在错误、事件中正确传递',
+    run: async () => {
+      const traces: (SubmitTrace | undefined)[] = [];
+      const batcher = new AdaptiveBatcher<number, number>({
+        minBatchSize: 2,
+        maxBatchSize: 10,
+        maxInflightBatches: 1,
+        flush: (batch) => batch.map((x) => x * 2),
+        onFlush: (event) => {
+          traces.push(...event.traces);
+        },
+      });
+
+      const trace1: SubmitTrace = { requestId: 'req-001', tags: ['user', 'write'] };
+      const trace2: SubmitTrace = { requestId: 'req-002', tags: ['user', 'read'] };
+
+      const p1 = batcher.submit(1, { trace: trace1 });
+      const p2 = batcher.submit(2, { trace: trace2 });
+      await batcher.forceFlush();
+
+      const results = await Promise.all([p1, p2]);
+      expect(results[0], '结果1正确').toBe(2);
+      expect(results[1], '结果2正确').toBe(4);
+
+      expect(traces.length, 'traces 数组长度正确').toBe(2);
+      expect(traces[0]?.requestId, 'trace1 requestId 正确').toBe('req-001');
+      expect(traces[1]?.tags?.[0], 'trace2 tags 正确').toBe('user');
+
+      // 测试 trace 在错误中的传递
+      const errBatcher = new AdaptiveBatcher<number, number>({
+        minBatchSize: 1,
+        maxBatchSize: 10,
+        maxInflightBatches: 1,
+        flush: () => { throw new Error('downstream error'); },
+      });
+
+      const trace3: SubmitTrace = { requestId: 'req-003' };
+      try {
+        await errBatcher.submit(1, { trace: trace3 });
+        throw new Error('should reject');
+      } catch (e) {
+        const err = e as BatcherError;
+        expect(err.trace?.requestId, '错误中 trace 正确').toBe('req-003');
+      }
+
+      await errBatcher.dispose();
+      await batcher.dispose();
+    },
+  },
+  {
+    name: '场景12: v5 熔断状态机 - normal -> degraded -> circuit-open -> half-open -> normal',
+    run: async () => {
+      const stateChanges: CircuitBreakerState[] = [];
+      let failCount = 0;
+
+      const batcher = new AdaptiveBatcher<number, number>({
+        minBatchSize: 1,
+        maxBatchSize: 10,
+        maxInflightBatches: 2,
+        circuitBreaker: {
+          enabled: true,
+          failureThreshold: 0.3,
+          slowDurationThresholdMs: 100,
+          degradationRatio: 0.5,
+          circuitOpenAfterDegradedMs: 200,
+          halfOpenAfterMs: 300,
+          halfOpenBatchSize: 1,
+          recoveryStepRatio: 0.5,
+        },
+        onCircuitStateChange: (state) => {
+          stateChanges.push(state);
+        },
+        flush: async (batch) => {
+          failCount++;
+          if (failCount <= 3) {
+            await new Promise((r) => setTimeout(r, 150));
+            throw new Error('slow and fail');
+          }
+          return batch.map((x) => x * 2);
+        },
+      });
+
+      // 第1次失败 -> degraded
+      try {
+        await batcher.submit(1);
+      } catch (e) {}
+      await new Promise((r) => setTimeout(r, 10));
+      expect(batcher.circuitState, '1次失败后 degraded').toBe('degraded');
+
+      // degraded 状态下再触发2次失败，让 failCount 到 3
+      try {
+        await batcher.submit(2);
+      } catch (e) {}
+      try {
+        await batcher.submit(3);
+      } catch (e) {}
+      await new Promise((r) => setTimeout(r, 10));
+
+      // degraded 持续 200ms 以上 -> circuit-open
+      await new Promise((r) => setTimeout(r, 250));
+      try {
+        await batcher.submit(99);
+      } catch (e) {
+        const err = e as BatcherError;
+        expect(err.code, 'circuit-open 状态返回 CIRCUIT_OPEN').toBe(BatcherErrorCode.CIRCUIT_OPEN);
+      }
+      expect(batcher.circuitState, '250ms 后 circuit-open').toBe('circuit-open');
+
+      // 等 half-open 窗口过去 -> half-open
+      await new Promise((r) => setTimeout(r, 350));
+      // 第4次应该成功，half-open 探测成功 -> 逐步恢复
+      const p4 = batcher.submit(4);
+      const r4 = await p4;
+      expect(r4, 'half-open 探测成功').toBe(8);
+
+      // 再提交几次让它恢复到 normal
+      const p5 = batcher.submit(5);
+      const p6 = batcher.submit(6);
+      const [r5, r6] = await Promise.all([p5, p6]);
+      expect(r5).toBe(10);
+      expect(r6).toBe(12);
+
+      expect(stateChanges.includes('degraded'), '状态变化包含 degraded').toBe(true);
+      expect(stateChanges.includes('circuit-open'), '状态变化包含 circuit-open').toBe(true);
+      expect(stateChanges.includes('half-open'), '状态变化包含 half-open').toBe(true);
+      expect(stateChanges.includes('normal'), '状态变化包含 normal').toBe(true);
+
+      await batcher.dispose();
+    },
+  },
+  {
+    name: '场景13: v5 熔断隔离 - 一个 key 熔断不影响其他 key',
+    run: async () => {
+      const keyStates: Record<string, CircuitBreakerState[]> = {};
+
+      const batcher = new PartitionedAdaptiveBatcher<number, number>({
+        perKeyMinBatchSize: 1,
+        perKeyMaxBatchSize: 5,
+        perKeyMaxInflightBatches: 2,
+        maxKeys: 10,
+        circuitBreaker: {
+          enabled: true,
+          failureThreshold: 0.3,
+          slowDurationThresholdMs: 50,
+          degradationRatio: 0.5,
+          circuitOpenAfterDegradedMs: 100,
+          halfOpenAfterMs: 500,
+          halfOpenBatchSize: 1,
+          recoveryStepRatio: 0.5,
+        },
+        onCircuitStateChange: (key, state) => {
+          if (!keyStates[key]) keyStates[key] = [];
+          keyStates[key].push(state);
+        },
+        flush: (key, batch) => {
+          if (key === 'bad') {
+            throw new Error('bad key always fails');
+          }
+          return batch.map((x) => x * 2);
+        },
+      });
+
+      // bad key 多次失败触发熔断
+      for (let i = 0; i < 3; i++) {
+        try {
+          await batcher.submit(i, { key: 'bad' });
+        } catch (e) {}
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      await new Promise((r) => setTimeout(r, 150));
+
+      // bad key 应该熔断
+      try {
+        await batcher.submit(99, { key: 'bad' });
+        throw new Error('should reject');
+      } catch (e) {
+        const err = e as BatcherError;
+        expect(err.code, 'bad key 熔断').toBe(BatcherErrorCode.CIRCUIT_OPEN);
+      }
+
+      // good key 应该正常工作
+      const pGood = batcher.submit(10, { key: 'good' });
+      const rGood = await pGood;
+      expect(rGood, 'good key 正常工作').toBe(20);
+
+      // 快照中可以看到不同的 circuitState
+      const snapshot = batcher.getSnapshot();
+      const badStats = snapshot.perKey['bad'];
+      const goodStats = snapshot.perKey['good'];
+      expect(badStats?.circuitState, 'bad key 快照 circuitState').toBe('circuit-open');
+      expect(goodStats?.circuitState, 'good key 快照 circuitState').toBe('normal');
+
+      await batcher.dispose();
+    },
+  },
+  {
+    name: '场景14: v5 定时快照导出 - 正确触发、停止后不继续',
+    run: async () => {
+      let exportCount = 0;
+      const snapshots: PartitionedSnapshot[] = [];
+
+      const batcher = new PartitionedAdaptiveBatcher<number, number>({
+        perKeyMinBatchSize: 1,
+        perKeyMaxBatchSize: 5,
+        maxKeys: 10,
+        flush: (key, batch) => batch.map((x) => x * 2),
+      });
+
+      // 先提交几个请求生成不同 key
+      await Promise.all([
+        batcher.submit(1, { key: 'a' }),
+        batcher.submit(2, { key: 'b' }),
+        batcher.submit(3, { key: 'c' }),
+      ]);
+
+      // 启动定时导出
+      batcher.startSnapshotExport(100, (snap) => {
+        exportCount++;
+        snapshots.push(snap);
+      });
+
+      // 等待 350ms，应该触发 3~4 次
+      await new Promise((r) => setTimeout(r, 350));
+
+      // 停止导出
+      batcher.stopSnapshotExport();
+      const countAfterStop = exportCount;
+
+      // 再等 200ms，不应该继续触发
+      await new Promise((r) => setTimeout(r, 200));
+      expect(exportCount, '停止后不再触发').toBe(countAfterStop);
+      expect(exportCount >= 3, '至少触发 3 次').toBe(true);
+      expect(snapshots[0].totalKeys, '快照包含 3 个 key').toBe(3);
+
+      // dispose 后也会停止
+      batcher.startSnapshotExport(50, () => {});
+      await batcher.dispose();
+      // dispose 已经清理了定时器，这里没有显式断言，只要不报错就行
+    },
+  },
+  {
+    name: '场景15: v5 边界 - 超时后统计反映失败和 lastError',
+    run: async () => {
+      const batcher = new AdaptiveBatcher<number, number>({
+        minBatchSize: 2,
+        maxBatchSize: 5,
+        maxInflightBatches: 1,
+        statsWindowMs: 5000,
+        flush: async (batch) => {
+          await new Promise((r) => setTimeout(r, 500));
+          return batch.map((x) => x * 2);
+        },
+      });
+
+      // 设置很短的超时，确保在 flush 过程中超时
+      const p1 = batcher.submit(1, { timeoutMs: 50 });
+      const p2 = batcher.submit(2);
+
+      try {
+        await p1;
+        throw new Error('should timeout');
+      } catch (e) {
+        const err = e as BatcherError;
+        expect(err.code, '超时错误码').toBe(BatcherErrorCode.TIMEOUT);
+      }
+
+      // 等 flush 完成
+      await new Promise((r) => setTimeout(r, 600));
+      await p2.catch(() => {});
+
+      const metrics = batcher.metrics;
+      const health = batcher.health;
+      expect(metrics.ewmaFailureRate > 0, '失败率 > 0').toBe(true);
+      expect(health.lastError != null, 'lastError 不为空').toBe(true);
+      expect(health.rollingStats.batchesFailed > 0, 'rollingStats batchesFailed > 0').toBe(true);
+
+      await batcher.dispose();
+    },
+  },
+  {
+    name: '场景16: v5 边界 - key 数量到上限时优雅返回不抛同步异常',
+    run: async () => {
+      const batcher = new PartitionedAdaptiveBatcher<number, number>({
+        maxKeys: 2,
+        perKeyMinBatchSize: 1,
+        perKeyMaxBatchSize: 5,
+        flush: (key, batch) => batch.map((x) => x * 2),
+      });
+
+      // 用满 2 个 key
+      const p1 = batcher.submit(1, { key: 'a' });
+      const p2 = batcher.submit(2, { key: 'b' });
+      await Promise.all([p1, p2]);
+
+      // 第 3 个 key 应该优雅返回 rejected Promise，而不是同步 throw
+      const p3 = batcher.submit(3, { key: 'c' });
+      expect(p3 instanceof Promise, '返回 Promise').toBe(true);
+
+      try {
+        await p3;
+        throw new Error('should reject');
+      } catch (e) {
+        const err = e as BatcherError;
+        expect(err.code, '错误码 QUEUE_OVERFLOW').toBe(BatcherErrorCode.QUEUE_OVERFLOW);
+        expect(err.message.includes('max 2 allowed'), '消息包含 max 2').toBe(true);
+      }
+
+      // 不影响已有的 key 继续工作
+      const p4 = batcher.submit(4, { key: 'a' });
+      const r4 = await p4;
+      expect(r4, '已有 key 正常工作').toBe(8);
+
+      await batcher.dispose();
+    },
+  },
 ];
 
 (async () => {
   console.log('='.repeat(75));
-  console.log('  自适应批量提交器 v4 - 可发 npm 版 测试验证');
+  console.log('  自适应批量提交器 v5 - 完善版 测试验证');
   console.log('='.repeat(75));
   console.log();
 

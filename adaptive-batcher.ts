@@ -1,7 +1,8 @@
 // ============================================================
-// Adaptive Batcher v4 — Production-ready
+// Adaptive Batcher v5 — Production-ready
 // 支持: 自适应攒批、双缓冲无阻塞、背压、部分失败重试、
-//       取消/超时(含flushing中)、按key分区、健康快照
+//       取消/超时(含flushing中)、按key分区、健康快照、
+//       请求追踪、按key熔断限流
 // ============================================================
 
 export enum BatcherErrorCode {
@@ -14,23 +15,26 @@ export enum BatcherErrorCode {
   DROPPED = 'DROPPED',
   PERMANENT_FAILURE = 'PERMANENT_FAILURE',
   RETRY_EXHAUSTED = 'RETRY_EXHAUSTED',
+  CIRCUIT_OPEN = 'CIRCUIT_OPEN',
 }
 
 export class BatcherError extends Error {
   readonly code: BatcherErrorCode;
   readonly retryable: boolean;
   readonly data?: unknown;
+  readonly trace?: SubmitTrace;
 
   constructor(
     code: BatcherErrorCode,
     message: string,
-    options: { retryable?: boolean; data?: unknown; cause?: unknown } = {}
+    options: { retryable?: boolean; data?: unknown; cause?: unknown; trace?: SubmitTrace } = {}
   ) {
     super(message);
     this.name = 'BatcherError';
     this.code = code;
     this.retryable = options.retryable ?? true;
     this.data = options.data;
+    this.trace = options.trace;
     if (options.cause) (this as unknown as { cause: unknown }).cause = options.cause;
   }
 }
@@ -54,10 +58,17 @@ export class PermanentFailure extends Error {
 export type OverflowStrategy = 'reject' | 'drop' | 'block';
 export type DisposeStrategy = 'drain' | 'reject' | 'kill';
 
+export interface SubmitTrace {
+  readonly requestId?: string;
+  readonly tags?: readonly string[];
+  readonly [key: string]: unknown;
+}
+
 export interface SubmitOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
   key?: string;
+  trace?: SubmitTrace;
 }
 
 export interface FlushEvent<T, R = unknown> {
@@ -68,6 +79,7 @@ export interface FlushEvent<T, R = unknown> {
   readonly error?: unknown;
   readonly results?: readonly R[];
   readonly items: readonly T[];
+  readonly traces: readonly (SubmitTrace | undefined)[];
   readonly timestamp: number;
   readonly attempt: number;
   readonly key?: string;
@@ -101,6 +113,20 @@ export interface HealthStatus {
   readonly rollingStats: RollingStats;
   readonly lastError: string | null;
   readonly overflowCount: number;
+  readonly circuitState: CircuitBreakerState;
+}
+
+export type CircuitBreakerState = 'normal' | 'degraded' | 'circuit-open' | 'half-open';
+
+export interface CircuitBreakerOptions {
+  enabled?: boolean;
+  failureThreshold?: number;
+  slowDurationThresholdMs?: number;
+  degradationRatio?: number;
+  circuitOpenAfterDegradedMs?: number;
+  halfOpenAfterMs?: number;
+  halfOpenBatchSize?: number;
+  recoveryStepRatio?: number;
 }
 
 export interface BatcherOptions<T, R> {
@@ -120,9 +146,11 @@ export interface BatcherOptions<T, R> {
   maxRetries?: number;
   retryDelayMs?: number;
   retryBackoffMultiplier?: number;
+  circuitBreaker?: CircuitBreakerOptions;
   flush: (batch: T[], attempt: number) => Promise<R[]> | R[];
   onFlush?: (event: FlushEvent<T, R>) => void | Promise<void>;
   onError?: (error: BatcherError, batch: T[]) => void | Promise<void>;
+  onCircuitStateChange?: (state: CircuitBreakerState, prevState: CircuitBreakerState) => void | Promise<void>;
   fallback?: (item: T) => R | Promise<R>;
 }
 
@@ -132,6 +160,7 @@ interface PendingItem<T, R> {
   reject: (reason: unknown) => void;
   timestamp: number;
   canceled: boolean;
+  trace?: SubmitTrace;
   timeoutTimer?: ReturnType<typeof setTimeout>;
   abortListener?: () => void;
   flushingTimer?: ReturnType<typeof setTimeout>;
@@ -197,6 +226,7 @@ export class AdaptiveBatcher<T, R> {
   private flush: (batch: T[], attempt: number) => Promise<R[]> | R[];
   private onFlush?: (event: FlushEvent<T, R>) => void | Promise<void>;
   private onError?: (error: BatcherError, batch: T[]) => void | Promise<void>;
+  private onCircuitStateChange?: (state: CircuitBreakerState, prevState: CircuitBreakerState) => void | Promise<void>;
   private fallback?: (item: T) => R | Promise<R>;
 
   private disposed = false;
@@ -204,6 +234,17 @@ export class AdaptiveBatcher<T, R> {
   private killSwitch = false;
   private killError?: BatcherError;
   private batcherKey?: string;
+
+  // ---- 熔断限流 ----
+  private circuitBreakerEnabled: boolean;
+  private circuitBreakerState: CircuitBreakerState = 'normal';
+  private degradedAt: number | null = null;
+  private circuitOpenedAt: number | null = null;
+  private halfOpenAttempts = 0;
+  private consecutiveSuccesses = 0;
+  private baseMaxInflightBatches: number;
+  private baseTargetBatchSize: number;
+  private circuitBreakerConfig: Required<CircuitBreakerOptions>;
 
   constructor(options: BatcherOptions<T, R> & { key?: string } = {} as BatcherOptions<T, R>) {
     this.minBatchSize = options.minBatchSize ?? 1;
@@ -221,6 +262,23 @@ export class AdaptiveBatcher<T, R> {
     this.retryDelayMs = options.retryDelayMs ?? 10;
     this.retryBackoffMultiplier = options.retryBackoffMultiplier ?? 2;
     this.batcherKey = (options as { key?: string }).key;
+
+    // 熔断配置初始化
+    const cb = options.circuitBreaker ?? {};
+    this.circuitBreakerEnabled = cb.enabled ?? true;
+    this.circuitBreakerConfig = {
+      enabled: cb.enabled ?? true,
+      failureThreshold: cb.failureThreshold ?? 0.3,
+      slowDurationThresholdMs: cb.slowDurationThresholdMs ?? 500,
+      degradationRatio: cb.degradationRatio ?? 0.5,
+      circuitOpenAfterDegradedMs: cb.circuitOpenAfterDegradedMs ?? 30_000,
+      halfOpenAfterMs: cb.halfOpenAfterMs ?? 10_000,
+      halfOpenBatchSize: cb.halfOpenBatchSize ?? 1,
+      recoveryStepRatio: cb.recoveryStepRatio ?? 0.2,
+    };
+    this.baseMaxInflightBatches = this.maxInflightBatches;
+    this.baseTargetBatchSize = this.targetBatchSize;
+
     this.rateTracker = {
       timestamps: [],
       windowMs: options.rateWindowMs ?? 1000,
@@ -238,6 +296,7 @@ export class AdaptiveBatcher<T, R> {
     this.flush = options.flush;
     this.onFlush = options.onFlush;
     this.onError = options.onError;
+    this.onCircuitStateChange = options.onCircuitStateChange;
     this.fallback = options.fallback;
   }
 
@@ -254,8 +313,36 @@ export class AdaptiveBatcher<T, R> {
       return Promise.reject(
         new BatcherError(BatcherErrorCode.CANCELED, 'Submit canceled by signal', {
           retryable: false,
+          trace: options.trace,
         })
       );
+    }
+
+    // 熔断检查
+    if (this.circuitBreakerEnabled) {
+      const now = Date.now();
+
+      // degraded 状态下检查是否需要转换到 circuit-open
+      if (this.circuitBreakerState === 'degraded' && this.degradedAt != null) {
+        if (now - this.degradedAt >= this.circuitBreakerConfig.circuitOpenAfterDegradedMs) {
+          this.transitionCircuitState('circuit-open');
+        }
+      }
+
+      // circuit-open 状态检查
+      if (this.circuitBreakerState === 'circuit-open') {
+        if (now - (this.circuitOpenedAt ?? 0) >= this.circuitBreakerConfig.halfOpenAfterMs) {
+          this.transitionCircuitState('half-open');
+        } else {
+          return Promise.reject(
+            new BatcherError(
+              BatcherErrorCode.CIRCUIT_OPEN,
+              `Circuit breaker is open for key ${this.batcherKey ?? 'default'}, try again later`,
+              { retryable: true, trace: options.trace }
+            )
+          );
+        }
+      }
     }
 
     const totalQueued = this.activeBuffer.length + this.inflightCount * this.targetBatchSize;
@@ -272,6 +359,7 @@ export class AdaptiveBatcher<T, R> {
         reject,
         timestamp: now,
         canceled: false,
+        trace: options.trace,
       };
 
       if (options.timeoutMs != null && options.timeoutMs > 0) {
@@ -325,10 +413,19 @@ export class AdaptiveBatcher<T, R> {
       this.activeBuffer.splice(idx, 1);
     }
 
-    item.reject(new BatcherError(code, message, { retryable: code === BatcherErrorCode.TIMEOUT }));
+    const err = new BatcherError(code, message, { retryable: code === BatcherErrorCode.TIMEOUT, trace: item.trace });
+    item.reject(err);
+
+    // 记录到统计，反映这次失败
+    if (code === BatcherErrorCode.TIMEOUT || code === BatcherErrorCode.CANCELED) {
+      const now = Date.now();
+      const queuedWaitMs = now - item.timestamp;
+      this.recordFlush(1, queuedWaitMs, 0, false, err, now);
+    }
   }
 
   private handleOverflow(item: T, options: SubmitOptions): Promise<R> {
+    const trace = options.trace;
     switch (this.overflowStrategy) {
       case 'drop': {
         if (this.fallback) {
@@ -340,7 +437,7 @@ export class AdaptiveBatcher<T, R> {
               new BatcherError(
                 BatcherErrorCode.DROPPED,
                 'Item dropped due to queue overflow, fallback failed',
-                { retryable: true, cause: e }
+                { retryable: true, cause: e, trace }
               )
             );
           }
@@ -349,7 +446,7 @@ export class AdaptiveBatcher<T, R> {
           new BatcherError(
             BatcherErrorCode.DROPPED,
             'Item dropped due to queue overflow (no fallback configured)',
-            { retryable: true, data: { item } }
+            { retryable: true, data: { item }, trace }
           )
         );
       }
@@ -364,7 +461,7 @@ export class AdaptiveBatcher<T, R> {
               new BatcherError(
                 BatcherErrorCode.DISPOSED,
                 'Batcher disposed while waiting for queue capacity',
-                { retryable: false }
+                { retryable: false, trace }
               )
             );
           }
@@ -372,6 +469,7 @@ export class AdaptiveBatcher<T, R> {
             return Promise.reject(
               new BatcherError(BatcherErrorCode.CANCELED, 'Submit canceled while waiting for capacity', {
                 retryable: false,
+                trace,
               })
             );
           }
@@ -379,6 +477,7 @@ export class AdaptiveBatcher<T, R> {
             return Promise.reject(
               new BatcherError(BatcherErrorCode.TIMEOUT, 'Timed out waiting for queue capacity', {
                 retryable: true,
+                trace,
               })
             );
           }
@@ -401,6 +500,7 @@ export class AdaptiveBatcher<T, R> {
             {
               retryable: true,
               data: { item, queueSize: this.activeBuffer.length, inflightCount: this.inflightCount },
+              trace,
             }
           )
         );
@@ -452,6 +552,7 @@ export class AdaptiveBatcher<T, R> {
       if (!evicted.success) sw.batchesFailed -= 1;
     }
     this.adaptParameters();
+    this.evaluateCircuitBreaker(success, flushDurationMs, now);
   }
 
   private isStatsStale(): boolean {
@@ -527,6 +628,123 @@ export class AdaptiveBatcher<T, R> {
       this.minWaitMs,
       this.maxWaitMs
     );
+  }
+
+  // ---- 熔断限流 ----
+  private transitionCircuitState(newState: CircuitBreakerState): void {
+    if (!this.circuitBreakerEnabled) return;
+    const prevState = this.circuitBreakerState;
+    if (newState === prevState) return;
+
+    this.circuitBreakerState = newState;
+
+    if (newState === 'degraded') {
+      this.degradedAt = Date.now();
+      this.circuitOpenedAt = null;
+      this.applyDegradation();
+    } else if (newState === 'circuit-open') {
+      this.circuitOpenedAt = Date.now();
+      this.degradedAt = null;
+    } else if (newState === 'half-open') {
+      this.halfOpenAttempts = 0;
+      this.consecutiveSuccesses = 0;
+      this.circuitOpenedAt = null;
+      this.degradedAt = null;
+      // half-open 状态下用小批次探测
+      this.maxInflightBatches = 1;
+      this.targetBatchSize = Math.max(this.minBatchSize, this.circuitBreakerConfig.halfOpenBatchSize);
+    } else if (newState === 'normal') {
+      this.degradedAt = null;
+      this.circuitOpenedAt = null;
+      this.consecutiveSuccesses = 0;
+      this.maxInflightBatches = this.baseMaxInflightBatches;
+      this.targetBatchSize = this.baseTargetBatchSize;
+    }
+
+    this.safeInvokeObserver(
+      () => this.onCircuitStateChange?.(newState, prevState),
+      'onCircuitStateChange'
+    );
+  }
+
+  private applyDegradation(): void {
+    const ratio = this.circuitBreakerConfig.degradationRatio;
+    this.maxInflightBatches = Math.max(1, Math.floor(this.baseMaxInflightBatches * ratio));
+    this.targetBatchSize = Math.max(
+      this.minBatchSize,
+      Math.floor(this.baseTargetBatchSize * ratio)
+    );
+  }
+
+  private applyRecoveryStep(): void {
+    const ratio = this.circuitBreakerConfig.recoveryStepRatio;
+    const targetInflight = Math.min(
+      this.baseMaxInflightBatches,
+      Math.ceil(this.maxInflightBatches * (1 + ratio))
+    );
+    const targetBatch = Math.min(
+      this.baseTargetBatchSize,
+      Math.ceil(this.targetBatchSize * (1 + ratio))
+    );
+    this.maxInflightBatches = targetInflight;
+    this.targetBatchSize = targetBatch;
+  }
+
+  private evaluateCircuitBreaker(success: boolean, flushDurationMs: number, now: number): void {
+    if (!this.circuitBreakerEnabled) return;
+
+    const state = this.circuitBreakerState;
+    const cfg = this.circuitBreakerConfig;
+    const isSlow = flushDurationMs > cfg.slowDurationThresholdMs;
+    const isFailing = !success || this.ewmaFailureRate > cfg.failureThreshold;
+
+    if (state === 'normal') {
+      if (isFailing || isSlow) {
+        this.consecutiveSuccesses = 0;
+        this.transitionCircuitState('degraded');
+      } else {
+        this.consecutiveSuccesses++;
+      }
+    } else if (state === 'degraded') {
+      if (isFailing || isSlow) {
+        this.consecutiveSuccesses = 0;
+        // degraded 持续时间超过阈值，进入 circuit-open
+        if (this.degradedAt != null && now - this.degradedAt >= cfg.circuitOpenAfterDegradedMs) {
+          this.transitionCircuitState('circuit-open');
+        }
+      } else {
+        this.consecutiveSuccesses++;
+        // 连续成功多次后逐步恢复
+        if (this.consecutiveSuccesses >= 3) {
+          this.applyRecoveryStep();
+          // 如果已恢复到接近基准值，回到 normal
+          if (
+            this.maxInflightBatches >= this.baseMaxInflightBatches * 0.9 &&
+            this.targetBatchSize >= this.baseTargetBatchSize * 0.9
+          ) {
+            this.transitionCircuitState('normal');
+          }
+        }
+      }
+    } else if (state === 'half-open') {
+      this.halfOpenAttempts++;
+      if (success && !isSlow) {
+        this.consecutiveSuccesses++;
+        // 探测成功，逐步恢复
+        this.applyRecoveryStep();
+        if (this.consecutiveSuccesses >= 2) {
+          // 连续成功，回到 normal
+          this.transitionCircuitState('normal');
+        }
+      } else {
+        // 探测失败，回到 circuit-open
+        this.transitionCircuitState('circuit-open');
+      }
+    }
+  }
+
+  get circuitState(): CircuitBreakerState {
+    return this.circuitBreakerState;
   }
 
   private tickle(): void {
@@ -633,7 +851,7 @@ export class AdaptiveBatcher<T, R> {
           continue;
         }
         it.flushingTimer = setTimeout(() => {
-          this.rejectItem(it, BatcherErrorCode.TIMEOUT, `Submit timed out during flush after ${it.deadline - it.timestamp}ms`);
+          this.rejectItem(it, BatcherErrorCode.TIMEOUT, `Submit timed out during flush after ${it.deadline! - it.timestamp}ms`);
         }, remaining);
       }
     }
@@ -672,7 +890,18 @@ export class AdaptiveBatcher<T, R> {
       clearTimeout(item.timeoutTimer);
       item.timeoutTimer = undefined;
     }
-    item.reject(new BatcherError(code, message, { retryable: code === BatcherErrorCode.TIMEOUT }));
+    const err = new BatcherError(code, message, {
+      retryable: code === BatcherErrorCode.TIMEOUT,
+      trace: item.trace,
+    });
+    item.reject(err);
+
+    // flushing 过程中被取消/超时，也要记录到统计
+    if (code === BatcherErrorCode.TIMEOUT || code === BatcherErrorCode.CANCELED) {
+      const now = Date.now();
+      const queuedWaitMs = now - item.timestamp;
+      this.recordFlush(1, queuedWaitMs, 0, false, err, now);
+    }
   }
 
   private async runFlushWithRetry(
@@ -715,18 +944,19 @@ export class AdaptiveBatcher<T, R> {
         const rawResults = await this.flush(aliveItems, attempt);
 
         const results = this.normalizeResults(rawResults, aliveItems.length);
-        const successCount = results.filter((r) => r.ok).length;
+        const successCount = results.filter((r) => 'ok' in r && r.ok).length;
 
         if (successCount === results.length) {
           for (let i = 0; i < remainingItems.length; i++) {
             const item = remainingItems[i];
+            const result = results[i];
             if (item.canceled) continue;
             if (item.flushingTimer) {
               clearTimeout(item.flushingTimer);
               item.flushingTimer = undefined;
             }
-            if (results[i].ok) {
-              item.resolve(results[i].value as R);
+            if ('ok' in result && result.ok) {
+              item.resolve(result.value as R);
               totalSucceeded++;
             }
           }
@@ -742,14 +972,14 @@ export class AdaptiveBatcher<T, R> {
           const item = remainingItems[i];
           if (item.canceled) continue;
 
-          if (r.ok) {
+          if ('ok' in r && r.ok) {
             if (item.flushingTimer) {
               clearTimeout(item.flushingTimer);
               item.flushingTimer = undefined;
             }
             item.resolve(r.value as R);
             totalSucceeded++;
-          } else if (r.permanent) {
+          } else if ('permanent' in r && r.permanent) {
             if (item.flushingTimer) {
               clearTimeout(item.flushingTimer);
               item.flushingTimer = undefined;
@@ -757,11 +987,11 @@ export class AdaptiveBatcher<T, R> {
             const err = new BatcherError(
               BatcherErrorCode.PERMANENT_FAILURE,
               `Permanent failure: ${r.errorMessage}`,
-              { retryable: false, cause: r.error }
+              { retryable: false, cause: r.error, trace: item.trace }
             );
             item.reject(err);
             hasAnyFailure = true;
-          } else if (r.retryable) {
+          } else if ('retryable' in r && r.retryable) {
             if (attempt >= totalAttempts) {
               if (item.flushingTimer) {
                 clearTimeout(item.flushingTimer);
@@ -770,7 +1000,7 @@ export class AdaptiveBatcher<T, R> {
               const err = new BatcherError(
                 BatcherErrorCode.RETRY_EXHAUSTED,
                 `Retry exhausted after ${attempt} attempts: ${r.errorMessage}`,
-                { retryable: true, cause: r.error }
+                { retryable: true, cause: r.error, trace: item.trace }
               );
               item.reject(err);
               hasAnyFailure = true;
@@ -782,9 +1012,10 @@ export class AdaptiveBatcher<T, R> {
 
         remainingItems = stillPending;
         if (stillPending.length > 0) {
-          lastError = results.find((r) => !r.ok && r.error)?.error;
+          const failResult = results.find((r) => !('ok' in r) && 'error' in r);
+          lastError = failResult && 'error' in failResult ? failResult.error : undefined;
         } else {
-          const firstFail = results.find((r) => !r.ok);
+          const firstFail = results.find((r) => !('ok' in r));
           if (firstFail && 'error' in firstFail) {
             lastError = firstFail.error;
           }
@@ -792,7 +1023,7 @@ export class AdaptiveBatcher<T, R> {
       } catch (caught) {
         lastError = caught;
         if (attempt >= totalAttempts) {
-          const wrapped = new BatcherError(
+          const baseErr = new BatcherError(
             BatcherErrorCode.FLUSH_FAILED,
             `Flush failed after ${attempt} attempts: ${(caught as Error).message}`,
             { cause: caught, retryable: true }
@@ -803,11 +1034,20 @@ export class AdaptiveBatcher<T, R> {
               clearTimeout(item.flushingTimer);
               item.flushingTimer = undefined;
             }
-            item.reject(wrapped);
+            if (item.trace) {
+              const errWithTrace = new BatcherError(baseErr.code, baseErr.message, {
+                retryable: baseErr.retryable,
+                cause: baseErr.cause,
+                trace: item.trace,
+              });
+              item.reject(errWithTrace);
+            } else {
+              item.reject(baseErr);
+            }
           }
           hasAnyFailure = true;
           this.safeInvokeObserver(
-            () => this.onError?.(wrapped, items),
+            () => this.onError?.(baseErr, items),
             'onError'
           );
           remainingItems = [];
@@ -822,7 +1062,15 @@ export class AdaptiveBatcher<T, R> {
           clearTimeout(item.flushingTimer);
           item.flushingTimer = undefined;
         }
-        item.reject(this.killError);
+        if (item.trace) {
+          const errWithTrace = new BatcherError(this.killError.code, this.killError.message, {
+            retryable: this.killError.retryable,
+            trace: item.trace,
+          });
+          item.reject(errWithTrace);
+        } else {
+          item.reject(this.killError);
+        }
       }
       remainingItems = [];
     }
@@ -851,6 +1099,7 @@ export class AdaptiveBatcher<T, R> {
           success,
           error: lastError,
           items: batch.map((b) => b.item),
+          traces: batch.map((b) => b.trace),
           timestamp: now,
           attempt,
           key: this.batcherKey,
@@ -945,14 +1194,32 @@ export class AdaptiveBatcher<T, R> {
             item.abortListener = undefined;
           } catch {}
         }
-        if (!item.canceled) item.reject(this.killError);
+        if (!item.canceled) {
+          if (item.trace) {
+            const errWithTrace = new BatcherError(this.killError.code, this.killError.message, {
+              retryable: this.killError.retryable,
+              trace: item.trace,
+            });
+            item.reject(errWithTrace);
+          } else {
+            item.reject(this.killError);
+          }
+        }
       }
       this.activeBuffer = [];
 
       for (const item of this.inflightItems) {
         if (!item.canceled) {
           if (item.flushingTimer) clearTimeout(item.flushingTimer);
-          item.reject(this.killError);
+          if (item.trace) {
+            const errWithTrace = new BatcherError(this.killError.code, this.killError.message, {
+              retryable: this.killError.retryable,
+              trace: item.trace,
+            });
+            item.reject(errWithTrace);
+          } else {
+            item.reject(this.killError);
+          }
           item.canceled = true;
         }
       }
@@ -962,7 +1229,7 @@ export class AdaptiveBatcher<T, R> {
     }
 
     if (strategy === 'reject') {
-      const err = new BatcherError(
+      const baseErr = new BatcherError(
         BatcherErrorCode.DISPOSED,
         'Batcher disposed: queued requests rejected, inflight continuing',
         { retryable: true }
@@ -975,7 +1242,17 @@ export class AdaptiveBatcher<T, R> {
             item.abortListener = undefined;
           } catch {}
         }
-        if (!item.canceled) item.reject(err);
+        if (!item.canceled) {
+          if (item.trace) {
+            const errWithTrace = new BatcherError(baseErr.code, baseErr.message, {
+              retryable: baseErr.retryable,
+              trace: item.trace,
+            });
+            item.reject(errWithTrace);
+          } else {
+            item.reject(baseErr);
+          }
+        }
       }
       this.activeBuffer = [];
       this.disposed = true;
@@ -1149,6 +1426,7 @@ export class AdaptiveBatcher<T, R> {
       rollingStats: stats,
       lastError: this.statsWindow.lastError,
       overflowCount: this.statsWindow.overflowCount,
+      circuitState: this.circuitBreakerState,
     };
   }
 
@@ -1195,9 +1473,11 @@ export interface PartitionedBatcherOptions<T, R> {
   maxRetries?: number;
   retryDelayMs?: number;
   retryBackoffMultiplier?: number;
+  circuitBreaker?: CircuitBreakerOptions;
   flush: (key: string, batch: T[], attempt: number) => Promise<R[]> | R[];
   onFlush?: (key: string, event: FlushEvent<T, R>) => void | Promise<void>;
   onError?: (key: string, error: BatcherError, batch: T[]) => void | Promise<void>;
+  onCircuitStateChange?: (key: string, state: CircuitBreakerState, prevState: CircuitBreakerState) => void | Promise<void>;
   perKeyFallback?: (key: string, item: T) => R | Promise<R>;
   keyLabel?: (key: string) => string;
 }
@@ -1216,6 +1496,7 @@ export interface KeyStats {
   readonly mode: 'low-latency' | 'balanced' | 'high-throughput' | 'idle';
   readonly lastError: string | null;
   readonly overflowCount: number;
+  readonly circuitState: CircuitBreakerState;
 }
 
 export interface PartitionedSnapshot {
@@ -1238,6 +1519,9 @@ export class PartitionedAdaptiveBatcher<T, R> {
   private perKeyMaxQueueSize: number;
   private perKeyOptions: PartitionedBatcherOptions<T, R>;
   private disposed = false;
+  private snapshotExportTimer: ReturnType<typeof setInterval> | null = null;
+  private snapshotExportCallback: ((snapshot: PartitionedSnapshot) => void | Promise<void>) | null = null;
+  private snapshotExportTopN = 10;
 
   constructor(options: PartitionedBatcherOptions<T, R>) {
     this.defaultKey = options.defaultKey ?? '__default__';
@@ -1282,10 +1566,14 @@ export class PartitionedAdaptiveBatcher<T, R> {
       maxRetries: opts.maxRetries,
       retryDelayMs: opts.retryDelayMs,
       retryBackoffMultiplier: opts.retryBackoffMultiplier,
+      circuitBreaker: opts.circuitBreaker,
       key,
       flush: (batch, attempt) => opts.flush(key, batch, attempt),
       onFlush: opts.onFlush ? (event) => opts.onFlush!(key, event) : undefined,
       onError: opts.onError ? (err, batch) => opts.onError!(key, err, batch) : undefined,
+      onCircuitStateChange: opts.onCircuitStateChange
+        ? (state, prev) => opts.onCircuitStateChange!(key, state, prev)
+        : undefined,
       fallback: opts.perKeyFallback ? (item) => opts.perKeyFallback!(key, item) : undefined,
     } as BatcherOptions<T, R> & { key: string });
   }
@@ -1311,7 +1599,21 @@ export class PartitionedAdaptiveBatcher<T, R> {
       );
     }
 
-    return this.getBatcher(key).submit(item, options);
+    try {
+      return this.getBatcher(key).submit(item, options);
+    } catch (e) {
+      // getBatcher 中 key 上限等同步异常，转为 rejected Promise
+      if (e instanceof BatcherError) {
+        return Promise.reject(e);
+      }
+      return Promise.reject(
+        new BatcherError(
+          BatcherErrorCode.FLUSH_FAILED,
+          `Submit failed: ${e instanceof Error ? e.message : String(e)}`,
+          { retryable: true, cause: e }
+        )
+      );
+    }
   }
 
   get totalQueueSize(): number {
@@ -1353,6 +1655,7 @@ export class PartitionedAdaptiveBatcher<T, R> {
       mode: batcher.mode,
       lastError: batcher.health.lastError,
       overflowCount: batcher.health.overflowCount,
+      circuitState: batcher.circuitState,
     };
   }
 
@@ -1398,6 +1701,37 @@ export class PartitionedAdaptiveBatcher<T, R> {
     };
   }
 
+  startSnapshotExport(
+    intervalMs: number,
+    callback: (snapshot: PartitionedSnapshot) => void | Promise<void>,
+    options: { topN?: number } = {}
+  ): void {
+    if (this.disposed) return;
+    this.stopSnapshotExport();
+    this.snapshotExportCallback = callback;
+    this.snapshotExportTopN = options.topN ?? 10;
+    this.snapshotExportTimer = setInterval(() => {
+      if (this.disposed) {
+        this.stopSnapshotExport();
+        return;
+      }
+      const snapshot = this.getSnapshot({ topN: this.snapshotExportTopN });
+      if (this.snapshotExportCallback) {
+        Promise.resolve()
+          .then(() => this.snapshotExportCallback!(snapshot))
+          .catch(() => {});
+      }
+    }, intervalMs);
+  }
+
+  stopSnapshotExport(): void {
+    if (this.snapshotExportTimer !== null) {
+      clearInterval(this.snapshotExportTimer);
+      this.snapshotExportTimer = null;
+    }
+    this.snapshotExportCallback = null;
+  }
+
   async forceFlush(key?: string): Promise<void> {
     if (key) {
       const batcher = this.batchers.get(key);
@@ -1410,6 +1744,7 @@ export class PartitionedAdaptiveBatcher<T, R> {
   async dispose(strategy: DisposeStrategy = 'drain'): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.stopSnapshotExport();
     await Promise.all(Array.from(this.batchers.values()).map((b) => b.dispose(strategy)));
     this.batchers.clear();
   }
